@@ -1,0 +1,5 @@
+# query_counter extension (pgstat-based)
+comment = 'Counts query executions by plannedstmt->queryId using pgstat custom kind'
+default_version = '1.0'
+relocatable = true
+module_pathname = '$libdir/query_counter'
