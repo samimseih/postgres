@@ -281,6 +281,11 @@ SELECT * FROM ft1 t1 WHERE t1.c3 = (SELECT MAX(c3) FROM ft2 t2) ORDER BY c1;
 WITH t1 AS (SELECT * FROM ft1 WHERE c1 <= 10) SELECT t2.c1, t2.c2, t2.c3, t2.c4 FROM t1, ft2 t2 WHERE t1.c1 = t2.c1 ORDER BY t1.c1;
 -- fixed values
 SELECT 'fixed', NULL FROM ft1 t1 WHERE c1 = 1;
+-- with WHERE clause and remote_plans with different formats
+EXPLAIN (REMOTE_PLANS, FORMAT YAML, VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE t1.c1 = 101;
+EXPLAIN (REMOTE_PLANS TRUE, FORMAT XML, VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE t1.c1 = 101;
+EXPLAIN (REMOTE_PLANS, FORMAT JSON, VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE t1.c1 = 101;
+EXPLAIN (REMOTE_PLANS TRUE, FORMAT TEXT, VERBOSE, COSTS OFF) SELECT * FROM ft1 t1 WHERE t1.c1 = 101;
 -- Test forcing the remote server to produce sorted data for a merge join.
 SET enable_hashjoin TO false;
 SET enable_nestloop TO false;
@@ -1489,6 +1494,33 @@ SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
 		SELECT ft2.c1 FROM ft2 JOIN ft4 ON ft2.c1 = ft4.c1)
 	ORDER BY ft1.c1 LIMIT 5;
 
+-- EXPLAIN remote_plans
+EXPLAIN (remote_plans, format text, costs off, analyze)
+SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
+	ft1.c1 IN (
+		SELECT ft2.c1 FROM ft2 JOIN ft4 ON ft2.c1 = ft4.c1)
+	ORDER BY ft1.c1 LIMIT 5;
+EXPLAIN (remote_plans, format text, costs off)
+SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
+	ft1.c1 IN (
+		SELECT ft2.c1 FROM ft2 JOIN ft4 ON ft2.c1 = ft4.c1)
+	ORDER BY ft1.c1 LIMIT 5;
+EXPLAIN (remote_plans, format xml, costs off)
+SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
+	ft1.c1 IN (
+		SELECT ft2.c1 FROM ft2 JOIN ft4 ON ft2.c1 = ft4.c1)
+	ORDER BY ft1.c1 LIMIT 5;
+EXPLAIN (remote_plans, format json, costs off)
+SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
+	ft1.c1 IN (
+		SELECT ft2.c1 FROM ft2 JOIN ft4 ON ft2.c1 = ft4.c1)
+	ORDER BY ft1.c1 LIMIT 5;
+EXPLAIN (remote_plans, format yaml, costs off)
+SELECT ft1.c1 FROM ft1 JOIN ft2 on ft1.c1 = ft2.c1 WHERE
+	ft1.c1 IN (
+		SELECT ft2.c1 FROM ft2 JOIN ft4 ON ft2.c1 = ft4.c1)
+	ORDER BY ft1.c1 LIMIT 5;
+
 -- ===================================================================
 -- test writable foreign table stuff
 -- ===================================================================
@@ -1537,6 +1569,10 @@ UPDATE ft2 SET c3 = 'bar' WHERE c1 = 1200 RETURNING tableoid::regclass;
 EXPLAIN (verbose, costs off)
 DELETE FROM ft2 WHERE c1 = 1200 RETURNING tableoid::regclass;                       -- can be pushed down
 DELETE FROM ft2 WHERE c1 = 1200 RETURNING tableoid::regclass;
+
+-- test write on foreign tables with remote_plans
+EXPLAIN (remote_plans, verbose, costs off)
+UPDATE ft2 SET c2 = c2 + 300 WHERE c1 % 10 = 3;
 
 -- Test UPDATE/DELETE with RETURNING on a three-table join
 INSERT INTO ft2 (c1,c2,c3)
@@ -4137,6 +4173,9 @@ INSERT INTO insert_tbl (SELECT * FROM local_tbl UNION ALL SELECT * FROM remote_t
 INSERT INTO insert_tbl (SELECT * FROM local_tbl UNION ALL SELECT * FROM remote_tbl);
 
 SELECT * FROM insert_tbl ORDER BY a;
+
+EXPLAIN (REMOTE_PLANS, VERBOSE, COSTS OFF)
+INSERT INTO insert_tbl (SELECT * FROM local_tbl UNION ALL SELECT * FROM remote_tbl);
 
 -- Check with direct modify
 EXPLAIN (VERBOSE, COSTS OFF)
