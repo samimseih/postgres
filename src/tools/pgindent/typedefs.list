@@ -2209,6 +2209,8 @@ PgChecksumMode
 PgFdwAnalyzeState
 PgFdwConnState
 PgFdwDirectModifyState
+PgFdwExplainRemotePlans
+PgFdwExplainState
 PgFdwModifyState
 PgFdwOption
 PgFdwPathExtraData

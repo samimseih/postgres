@@ -43,7 +43,6 @@
 #include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/guc.h"
-#include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -2840,7 +2839,7 @@ postgresEndDirectModify(ForeignScanState *node)
 static void
 postgresExplainStatement(int plan_node_id,
 						 ExplainState *es,
-						 PgFdwExplainState * pgfdw_explain_state,
+						 PgFdwExplainState *pgfdw_explain_state,
 						 PGconn *conn,
 						 char *sql)
 {
@@ -2861,12 +2860,16 @@ postgresExplainStatement(int plan_node_id,
 										FORMAT %s, \
 										VERBOSE %d, \
 										COSTS %d, \
-										SETTINGS %d) \
+										SETTINGS %d, \
+										MEMORY %d, \
+										SUMMARY %d) \
 										%s",
 						 explain_formats[es->format],
 						 (es->verbose) ? 1 : 0,
 						 (es->costs) ? 1 : 0,
 						 (es->settings) ? 1 : 0,
+						 (es->memory) ? 1 : 0,
+						 (es->summary) ? 1 : 0,
 						 sql);
 
 		/* Run the query and collect the remote plan */
@@ -2877,7 +2880,7 @@ postgresExplainStatement(int plan_node_id,
 		numrows = PQntuples(res);
 
 		for (i = 0; i < numrows; i++)
-			appendStringInfo(&explain->explain_plan, "%s\n", pstrdup(PQgetvalue(res, i, 0)));
+			appendStringInfo(&explain->explain_plan, "%s\n", PQgetvalue(res, i, 0));
 
 		if (explain->explain_plan.len > 0 && explain->explain_plan.data[explain->explain_plan.len - 1] == '\n')
 			explain->explain_plan.data[--explain->explain_plan.len] = '\0';
@@ -2897,6 +2900,27 @@ postgresExplainStatement(int plan_node_id,
 }
 
 /*
+ * explain_remote_query
+ *		Helper function to get connection and execute remote EXPLAIN
+ */
+static void
+explain_remote_query(int plan_node_id, ExplainState *es,
+					 PgFdwExplainState *pgfdw_explain_state,
+					 Oid foreign_table_oid, char *sql)
+{
+	UserMapping *user;
+	PGconn	   *conn;
+	ForeignTable *table;
+
+	table = GetForeignTable(foreign_table_oid);
+	user = GetUserMapping(GetUserId(), table->serverid);
+	conn = GetConnection(user, false, NULL);
+
+	postgresExplainStatement(plan_node_id, es, pgfdw_explain_state, conn, sql);
+	ReleaseConnection(conn);
+}
+
+/*
  * postgresExplainForeignScan
  *		Produce extra output for EXPLAIN of a ForeignScan on a foreign table
  */
@@ -2907,7 +2931,10 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 	List	   *fdw_private = plan->fdw_private;
 	PgFdwExplainState *pgfdw_explain_state;
 	char	   *sql;
-	List	   *foreign_scan_table = NIL;
+	Oid			foreign_table_oid = InvalidOid;
+
+	if (node->ss.ss_currentRelation)
+		foreign_table_oid = RelationGetRelid(node->ss.ss_currentRelation);
 
 	/*
 	 * Identify foreign scans that are really joins or upper relations.  The
@@ -2971,11 +2998,10 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 				relname = get_rel_name(rte->relid);
 
 				/*
-				 * add one of the tables to foreign_scan_table to get the
-				 * serverId for remote plans
+				 * Save first table OID for getting server connection
 				 */
-				if (list_length(foreign_scan_table) == 0)
-					foreign_scan_table = lappend_oid(foreign_scan_table, rte->relid);
+				if (!OidIsValid(foreign_table_oid))
+					foreign_table_oid = rte->relid;
 
 				if (es->verbose)
 				{
@@ -3012,29 +3038,15 @@ postgresExplainForeignScan(ForeignScanState *node, ExplainState *es)
 
 	pgfdw_explain_state = GetExplainExtensionState(es, GET_EXTENSION_ID());
 
+	/* If we don't have a foreign table oid by now, something went wrong */
+	Assert(foreign_table_oid);
+
 	if (pgfdw_explain_state && pgfdw_explain_state->remote_plans)
-	{
-		UserMapping *user = NULL;
-		PGconn	   *conn = NULL;
-		ForeignTable *table;
-
-		if (node && !node->ss.ss_currentRelation &&
-			foreign_scan_table == NIL)
-			return;
-
-		if (node && node->ss.ss_currentRelation)
-			table = GetForeignTable(RelationGetRelid(node->ss.ss_currentRelation));
-		else
-			table = GetForeignTable(list_nth_oid(foreign_scan_table, 0));
-
-		Assert(table);
-
-		user = GetUserMapping(GetUserId(), table->serverid);
-		conn = GetConnection(user, false, NULL);
-
-		postgresExplainStatement(node->ss.ps.plan->plan_node_id, es, pgfdw_explain_state, conn, sql);
-		ReleaseConnection(conn);
-	}
+		explain_remote_query(node->ss.ps.plan->plan_node_id,
+							 es,
+							 pgfdw_explain_state,
+							 foreign_table_oid,
+							 sql);
 }
 
 /*
@@ -3066,21 +3078,11 @@ postgresExplainForeignModify(ModifyTableState *mtstate,
 
 	pgfdw_explain_state = GetExplainExtensionState(es, GET_EXTENSION_ID());
 	if (pgfdw_explain_state && pgfdw_explain_state->remote_plans)
-	{
-		UserMapping *user = NULL;
-		PGconn	   *conn = NULL;
-		ForeignTable *table;
-
-		table = GetForeignTable(rinfo->ri_RelationDesc->rd_rel->oid);
-
-		Assert(table);
-
-		user = GetUserMapping(GetUserId(), table->serverid);
-		conn = GetConnection(user, false, NULL);
-
-		postgresExplainStatement(mtstate->ps.plan->plan_node_id, es, pgfdw_explain_state, conn, sql);
-		ReleaseConnection(conn);
-	}
+		explain_remote_query(mtstate->ps.plan->plan_node_id,
+							 es,
+							 pgfdw_explain_state,
+							 rinfo->ri_RelationDesc->rd_rel->oid,
+							 sql);
 }
 
 /*
@@ -3104,21 +3106,11 @@ postgresExplainDirectModify(ForeignScanState *node, ExplainState *es)
 	pgfdw_explain_state = GetExplainExtensionState(es, GET_EXTENSION_ID());
 
 	if (pgfdw_explain_state && pgfdw_explain_state->remote_plans)
-	{
-		UserMapping *user = NULL;
-		PGconn	   *conn = NULL;
-		ForeignTable *table;
-
-		table = GetForeignTable(RelationGetRelid(node->ss.ss_currentRelation));
-
-		Assert(table);
-
-		user = GetUserMapping(GetUserId(), table->serverid);
-		conn = GetConnection(user, false, NULL);
-
-		postgresExplainStatement(node->ss.ps.plan->plan_node_id, es, pgfdw_explain_state, conn, sql);
-		ReleaseConnection(conn);
-	}
+		explain_remote_query(node->ss.ps.plan->plan_node_id,
+							 es,
+							 pgfdw_explain_state,
+							 RelationGetRelid(node->ss.ss_currentRelation),
+							 sql);
 }
 
 /*
@@ -8051,7 +8043,7 @@ postgresExplainPerNode(PlanState *planstate, List *ancestors,
 }
 
 static void
-pgfdwFormatRemotePlan(PgFdwExplainRemotePlans * explain,
+pgfdwFormatRemotePlan(PgFdwExplainRemotePlans *explain,
 					  ExplainState *es,
 					  int plan_node_id)
 {
