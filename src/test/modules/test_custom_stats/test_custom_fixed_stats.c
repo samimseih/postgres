@@ -54,9 +54,9 @@ static const PgStat_KindInfo custom_stats = {
 	.shared_data_off = offsetof(PgStatShared_CustomFixedEntry, stats),
 	.shared_data_len = sizeof(((PgStatShared_CustomFixedEntry *) 0)->stats),
 
-	.init_shmem_cb = test_custom_stats_fixed_init_shmem_cb,
+	.init_shmem_cb = NULL,
 	.reset_all_cb = test_custom_stats_fixed_reset_all_cb,
-	.snapshot_cb = NULL,
+	.snapshot_cb = test_custom_stats_fixed_snapshot_cb,
 };
 
 /*
