@@ -1331,6 +1331,30 @@ pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *creat
 	entry_ref = pgstat_get_entry_ref(kind, dboid, objid,
 									 true, created_entry);
 
+	pgstat_prep_pending(entry_ref);
+
+	return entry_ref;
+}
+
+/*
+ * Set up pending data for the given entry reference, allocating the pending
+ * buffer if not already done.  This allows callers that obtained an entry_ref
+ * via pgstat_get_entry_ref() to attach pending data without a redundant
+ * lookup.
+ */
+void
+pgstat_prep_pending(PgStat_EntryRef *entry_ref)
+{
+	PgStat_Kind kind = entry_ref->shared_entry->key.kind;
+
+	if (unlikely(!pgStatPendingContext))
+	{
+		pgStatPendingContext =
+			AllocSetContextCreate(TopMemoryContext,
+								  "PgStat Pending",
+								  ALLOCSET_SMALL_SIZES);
+	}
+
 	if (entry_ref->pending == NULL)
 	{
 		size_t		entrysize = pgstat_get_kind_info(kind)->pending_size;
@@ -1340,8 +1364,6 @@ pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *creat
 		entry_ref->pending = MemoryContextAllocZero(pgStatPendingContext, entrysize);
 		dlist_push_tail(&pgStatPending, &entry_ref->pending_node);
 	}
-
-	return entry_ref;
 }
 
 /*
