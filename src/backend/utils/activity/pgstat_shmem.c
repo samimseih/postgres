@@ -573,6 +573,20 @@ PgStat_EntryRef *
 pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid, bool create,
 					 bool *created_entry)
 {
+	return pgstat_get_entry_ref_extended(kind, dboid, objid, create,
+										 created_entry, 0);
+}
+
+/*
+ * Extended version of pgstat_get_entry_ref with flags parameter.
+ *
+ * Supports PGSTAT_ENTRY_REF_NO_OOM: return NULL instead of raising an ERROR
+ * when shared memory allocation for a new entry fails.
+ */
+PgStat_EntryRef *
+pgstat_get_entry_ref_extended(PgStat_Kind kind, Oid dboid, uint64 objid,
+							  bool create, bool *created_entry, int flags)
+{
 	PgStat_HashKey key = {0};
 	PgStatShared_HashEntry *shhashent;
 	PgStatShared_Common *shheader = NULL;
@@ -634,7 +648,19 @@ pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid, bool create,
 		 * lookup. If so, fall through to the same path as if we'd have if it
 		 * already had been created before the dshash_find() calls.
 		 */
-		shhashent = dshash_find_or_insert(hash, &key, &shfound);
+		if (flags & PGSTAT_ENTRY_REF_NO_OOM)
+		{
+			shhashent = dshash_find_or_insert_extended(hash, &key, &shfound,
+													   DSHASH_INSERT_NO_OOM);
+			if (shhashent == NULL)
+			{
+				pgstat_release_entry_ref(key, entry_ref, false);
+				return NULL;
+			}
+		}
+		else
+			shhashent = dshash_find_or_insert(hash, &key, &shfound);
+
 		if (!shfound)
 		{
 			shheader = pgstat_init_entry(kind, shhashent);
@@ -645,6 +671,12 @@ pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid, bool create,
 				 * shared hashtable before giving up.
 				 */
 				dshash_delete_entry(hash, shhashent);
+
+				if (flags & PGSTAT_ENTRY_REF_NO_OOM)
+				{
+					pgstat_release_entry_ref(key, entry_ref, false);
+					return NULL;
+				}
 
 				ereport(ERROR,
 						(errcode(ERRCODE_OUT_OF_MEMORY),

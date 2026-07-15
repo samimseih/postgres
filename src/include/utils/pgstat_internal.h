@@ -822,8 +822,15 @@ extern bool pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat
 extern void pgstat_attach_shmem(void);
 extern void pgstat_detach_shmem(void);
 
+/* Flags for pgstat_get_entry_ref_extended */
+#define PGSTAT_ENTRY_REF_NO_OOM		0x01	/* return NULL instead of ERROR on
+											 * allocation failure */
+
 extern PgStat_EntryRef *pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid,
 											 bool create, bool *created_entry);
+extern PgStat_EntryRef *pgstat_get_entry_ref_extended(PgStat_Kind kind, Oid dboid,
+													  uint64 objid, bool create,
+													  bool *created_entry, int flags);
 extern bool pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait);
 extern bool pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait);
 extern void pgstat_unlock_entry(PgStat_EntryRef *entry_ref);
