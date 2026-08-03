@@ -541,13 +541,6 @@ typedef struct PgStatShared_Backend
  */
 typedef struct PgStat_ShmemControl
 {
-	void	   *raw_dsa_area;
-
-	/*
-	 * Stats for variable-numbered objects are kept in this shared hash table.
-	 * See comment above PgStat_Kind for details.
-	 */
-	dshash_table_handle hash_handle;	/* shared dbstat hash */
 
 	/* Has the stats system already been shut down? Just a debugging check. */
 	bool		is_shutdown;

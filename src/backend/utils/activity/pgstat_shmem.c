@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "pgstat.h"
+#include "storage/dsm_registry.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 #include "utils/memutils.h"
@@ -100,36 +101,19 @@ static MemoryContext pgStatEntryRefHashContext = NULL;
 
 
 /* ------------------------------------------------------------
- * Public functions called from postmaster follow
+ * Shared memory setup and attach/detach
+ *
+ * Fixed-numbered statistics are allocated in plain shared memory,
+ * initialized via StatsShmemSize/StatsShmemInit.
+ *
+ * Variable-numbered statistics are stored in a dshash table created
+ * via the DSM registry.
  * ------------------------------------------------------------
  */
 
-/*
- * The size of the shared memory allocation for stats stored in the shared
- * stats hash table. This allocation will be done as part of the main shared
- * memory, rather than dynamic shared memory, allowing it to be initialized in
- * postmaster.
- */
-static Size
-pgstat_dsa_init_size(void)
-{
-	Size		sz;
-
-	/*
-	 * The dshash header / initial buckets array needs to fit into "plain"
-	 * shared memory, but it's beneficial to not need dsm segments
-	 * immediately. A size of 256kB seems works well and is not
-	 * disproportional compared to other constant sized shared memory
-	 * allocations. NB: To avoid DSMs further, the user can configure
-	 * min_dynamic_shared_memory.
-	 */
-	sz = 256 * 1024;
-	Assert(dsa_minimum_size() <= sz);
-	return MAXALIGN(sz);
-}
 
 /*
- * Compute shared memory space needed for cumulative statistics
+ * Compute shared memory space needed for fixed-numbered statistics.
  */
 static Size
 StatsShmemSize(void)
@@ -137,7 +121,6 @@ StatsShmemSize(void)
 	Size		sz;
 
 	sz = MAXALIGN(sizeof(PgStat_ShmemControl));
-	sz = add_size(sz, pgstat_dsa_init_size());
 
 	/* Add shared memory for all the custom fixed-numbered statistics */
 	for (PgStat_Kind kind = PGSTAT_KIND_CUSTOM_MIN; kind <= PGSTAT_KIND_CUSTOM_MAX; kind++)
@@ -157,7 +140,7 @@ StatsShmemSize(void)
 }
 
 /*
- * Register shared memory area for cumulative statistics
+ * Register shared memory area for fixed-numbered statistics.
  */
 static void
 StatsShmemRequest(void *arg)
@@ -169,53 +152,16 @@ StatsShmemRequest(void *arg)
 }
 
 /*
- * Initialize cumulative statistics system during startup
+ * Initialize fixed-numbered statistics in shared memory during startup.
  */
 static void
 StatsShmemInit(void *arg)
 {
-	dsa_area   *dsa;
-	dshash_table *dsh;
 	PgStat_ShmemControl *ctl = pgStatLocal.shmem;
 	char	   *p = (char *) ctl;
 
 	/* the allocation of pgStatLocal.shmem itself */
 	p += MAXALIGN(sizeof(PgStat_ShmemControl));
-
-	/*
-	 * Create a small dsa allocation in plain shared memory. This is required
-	 * because postmaster cannot use dsm segments. It also provides a small
-	 * efficiency win.
-	 */
-	ctl->raw_dsa_area = p;
-	p += pgstat_dsa_init_size();
-	dsa = dsa_create_in_place(ctl->raw_dsa_area,
-							  pgstat_dsa_init_size(),
-							  LWTRANCHE_PGSTATS_DSA, NULL);
-	dsa_pin(dsa);
-
-	/*
-	 * To ensure dshash is created in "plain" shared memory, temporarily limit
-	 * size of dsa to the initial size of the dsa.
-	 */
-	dsa_set_size_limit(dsa, pgstat_dsa_init_size());
-
-	/*
-	 * With the limit in place, create the dshash table. XXX: It'd be nice if
-	 * there were dshash_create_in_place().
-	 */
-	dsh = dshash_create(dsa, &dsh_params, NULL);
-	ctl->hash_handle = dshash_get_hash_table_handle(dsh);
-
-	/* lift limit set above */
-	dsa_set_size_limit(dsa, -1);
-
-	/*
-	 * Postmaster will never access these again, thus free the local
-	 * dsa/dshash references.
-	 */
-	dshash_detach(dsh);
-	dsa_detach(dsa);
 
 	pg_atomic_init_u64(&ctl->gc_request_count, 1);
 
@@ -252,27 +198,23 @@ StatsShmemInit(void *arg)
 	}
 }
 
+/*
+ * Attach to the dshash table for variable-numbered statistics.
+ */
 void
 pgstat_attach_shmem(void)
 {
-	MemoryContext oldcontext;
+	bool		found;
 
 	Assert(pgStatLocal.dsa == NULL);
 
-	/* stats shared memory persists for the backend lifetime */
-	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
-
-	pgStatLocal.dsa = dsa_attach_in_place(pgStatLocal.shmem->raw_dsa_area,
-										  NULL);
-	dsa_pin_mapping(pgStatLocal.dsa);
-
-	pgStatLocal.shared_hash = dshash_attach(pgStatLocal.dsa, &dsh_params,
-											pgStatLocal.shmem->hash_handle,
-											NULL);
-
-	MemoryContextSwitchTo(oldcontext);
+	pgStatLocal.shared_hash = GetNamedDSHash("pgstat", &dsh_params, &found);
+	pgStatLocal.dsa = dshash_get_dsa_area(pgStatLocal.shared_hash);
 }
 
+/*
+ * Detach from the dshash table for variable-numbered statistics.
+ */
 void
 pgstat_detach_shmem(void)
 {
@@ -283,16 +225,6 @@ pgstat_detach_shmem(void)
 
 	dshash_detach(pgStatLocal.shared_hash);
 	pgStatLocal.shared_hash = NULL;
-
-	dsa_detach(pgStatLocal.dsa);
-
-	/*
-	 * dsa_detach() does not decrement the DSA reference count as no segment
-	 * was provided to dsa_attach_in_place(), causing no cleanup callbacks to
-	 * be registered.  Hence, release it manually now.
-	 */
-	dsa_release_in_place(pgStatLocal.shmem->raw_dsa_area);
-
 	pgStatLocal.dsa = NULL;
 }
 

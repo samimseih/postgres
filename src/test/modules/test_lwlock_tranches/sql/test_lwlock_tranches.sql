@@ -34,9 +34,10 @@ SELECT test_lwlock_initialize(65535);
 --
 -- MAX_USER_DEFINED_TRANCHES is 256. Two locks were created with
 -- RequestNamedLWLockTranche() when the library was loaded, and we created
--- four more.
+-- four more. One additional tranche is reserved by the cumulative statistics
+-- system (registered via GetNamedDSHash).
 insert into test_tranches
     select 'test_tranche_consume_all', test_lwlock_tranche_create('test_tranche_consume_all')
-    from generate_series(1, 256 - 2 - 4);
+    from generate_series(1, 256 - 2 - 4 - 1);
 
 select test_lwlock_tranche_create('out-of-tranches');
