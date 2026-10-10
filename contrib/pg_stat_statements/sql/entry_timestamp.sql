@@ -110,5 +110,28 @@ SELECT
 FROM pg_stat_statements
 WHERE query LIKE '%STMTTS%';
 
+-- min/max reset keeps mean and standard deviation
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+SELECT pg_sleep(0.001) AS "STMTTS_MINMAX";
+SELECT pg_sleep(0.03) AS "STMTTS_MINMAX";
+SELECT mean_exec_time AS mean_before, stddev_exec_time AS stddev_before
+FROM pg_stat_statements
+WHERE query = 'SELECT pg_sleep($1) AS "STMTTS_MINMAX"' \gset
+SELECT pg_stat_statements_reset(0, 0, 0, true) IS NOT NULL AS t;
+SELECT calls,
+  min_exec_time + max_exec_time = 0 AS minmax_exec_zero,
+  mean_exec_time = :mean_before AS mean_kept,
+  stddev_exec_time = :stddev_before AS stddev_kept,
+  stddev_exec_time > 0 AS stddev_nonzero
+FROM pg_stat_statements
+WHERE query = 'SELECT pg_sleep($1) AS "STMTTS_MINMAX"';
+SELECT pg_sleep(0.001) AS "STMTTS_MINMAX";
+SELECT calls,
+  min_exec_time > 0 AS min_exec_set,
+  max_exec_time >= min_exec_time AS max_exec_set,
+  stddev_exec_time > 0 AS stddev_nonzero
+FROM pg_stat_statements
+WHERE query = 'SELECT pg_sleep($1) AS "STMTTS_MINMAX"';
+
 -- Cleanup
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
