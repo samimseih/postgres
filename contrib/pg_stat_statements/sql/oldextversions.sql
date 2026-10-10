@@ -42,6 +42,9 @@ SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 -- and view for pg_stat_statements introduced in 1.9
 AlTER EXTENSION pg_stat_statements UPDATE TO '1.9';
 SELECT pg_get_functiondef('pg_stat_statements_info'::regproc);
+-- the old definition of pg_stat_statements_info still works
+SELECT dealloc >= 0 AS dealloc_ok, stats_reset IS NOT NULL AS stats_reset_ok
+  FROM pg_stat_statements_info;
 \d pg_stat_statements
 SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 
@@ -66,6 +69,13 @@ SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 -- New functions and views for pg_stat_statements in 1.13
 AlTER EXTENSION pg_stat_statements UPDATE TO '1.13';
 \d pg_stat_statements
+SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
+
+-- Functions marked PARALLEL RESTRICTED, and new columns in
+-- pg_stat_statements_info, in 1.14
+AlTER EXTENSION pg_stat_statements UPDATE TO '1.14';
+\d pg_stat_statements
+\d pg_stat_statements_info
 SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 
 DROP EXTENSION pg_stat_statements;

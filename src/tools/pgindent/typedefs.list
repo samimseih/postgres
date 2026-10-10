@@ -2302,6 +2302,7 @@ PgStatShared_HashEntry
 PgStatShared_Index
 PgStatShared_IO
 PgStatShared_Lock
+PgStatShared_Pgss
 PgStatShared_Relation
 PgStatShared_ReplSlot
 PgStatShared_SLRU
@@ -2332,6 +2333,7 @@ PgStat_LockEntry
 PgStat_PendingDroppedStatsItem
 PgStat_PendingIO
 PgStat_PendingLock
+PgStat_PgssPending
 PgStat_RelationStatus
 PgStat_SLRUStats
 PgStat_ShmemControl
@@ -4123,12 +4125,15 @@ pgsa_stash_name_table_hash
 pgsa_writer_context
 pgsocket
 pgsql_thing_t
+pgssEvictCandidate
+pgssEvictContext
 pgssEntry
-pgssGlobalStats
 pgssHashKey
+pgssResetFilter
 pgssSharedState
 pgssStoreKind
 pgssVersion
+pgssViewRow
 pgstat_entry_ref_hash_hash
 pgstat_entry_ref_hash_iterator
 pgstat_page

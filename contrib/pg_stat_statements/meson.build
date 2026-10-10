@@ -2,6 +2,7 @@
 
 pg_stat_statements_sources = files(
   'pg_stat_statements.c',
+  'pg_stat_statements_stats.c',
 )
 
 if host_system == 'windows'
@@ -21,6 +22,7 @@ contrib_targets += pg_stat_statements
 install_data(
   'pg_stat_statements.control',
   'pg_stat_statements--1.4.sql',
+  'pg_stat_statements--1.13--1.14.sql',
   'pg_stat_statements--1.12--1.13.sql',
   'pg_stat_statements--1.11--1.12.sql',
   'pg_stat_statements--1.10--1.11.sql',

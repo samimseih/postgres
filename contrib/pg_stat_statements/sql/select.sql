@@ -130,7 +130,10 @@ DROP TABLE pgss_a, pgss_b CASCADE;
 -- access to pg_stat_statements_info view
 --
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
-SELECT dealloc FROM pg_stat_statements_info;
+SELECT dealloc, entry_count >= 0 AS entry_count_ok,
+       entry_dsa_size > 0 AS entry_dsa_size_ok,
+       stats_reset IS NOT NULL AS stats_reset_ok
+FROM pg_stat_statements_info;
 
 -- FROM [ONLY]
 CREATE TABLE tbl_inh(id integer);

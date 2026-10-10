@@ -394,10 +394,13 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
  t
 (1 row)
 
-SELECT dealloc FROM pg_stat_statements_info;
- dealloc 
----------
-       0
+SELECT dealloc, entry_count >= 0 AS entry_count_ok,
+       entry_dsa_size > 0 AS entry_dsa_size_ok,
+       stats_reset IS NOT NULL AS stats_reset_ok
+FROM pg_stat_statements_info;
+ dealloc | entry_count_ok | entry_dsa_size_ok | stats_reset_ok 
+---------+----------------+-------------------+----------------
+       0 | t              | t                 | t
 (1 row)
 
 -- FROM [ONLY]

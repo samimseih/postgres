@@ -3,10 +3,12 @@
 MODULE_big = pg_stat_statements
 OBJS = \
 	$(WIN32RES) \
-	pg_stat_statements.o
+	pg_stat_statements.o \
+	pg_stat_statements_stats.o
 
 EXTENSION = pg_stat_statements
 DATA = pg_stat_statements--1.4.sql \
+	pg_stat_statements--1.13--1.14.sql \
 	pg_stat_statements--1.12--1.13.sql \
 	pg_stat_statements--1.11--1.12.sql pg_stat_statements--1.10--1.11.sql \
 	pg_stat_statements--1.9--1.10.sql pg_stat_statements--1.8--1.9.sql \
