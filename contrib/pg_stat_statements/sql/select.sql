@@ -130,7 +130,11 @@ DROP TABLE pgss_a, pgss_b CASCADE;
 -- access to pg_stat_statements_info view
 --
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
-SELECT dealloc FROM pg_stat_statements_info;
+SELECT entry_dealloc, entry_dsa_size > 0 AS entry_dsa_size_ok,
+       qtext_dsa_size > 0 AS qtext_dsa_size_ok,
+       qtext_count >= 0 AS qtext_count_ok,
+       qtext_total_len >= 0 AS qtext_total_len_ok
+FROM pg_stat_statements_info;
 
 -- FROM [ONLY]
 CREATE TABLE tbl_inh(id integer);
@@ -269,3 +273,16 @@ DROP SCHEMA pgss_schema_1 CASCADE;
 DROP SCHEMA pgss_schema_2 CASCADE;
 DROP TABLE tab_search_same, tab_search_diff_1, tab_search_diff_2;
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+
+--
+-- reset within a transaction: entries with unflushed pending data should
+-- still be removed and not reappear in the view
+--
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+BEGIN;
+SELECT 1 AS "RESET_TXN_TEST";
+SELECT count(*) FROM pg_stat_statements WHERE query LIKE '%RESET_TXN_TEST%';
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+SET LOCAL pg_stat_statements.track = none;
+SELECT count(*) FROM pg_stat_statements WHERE query LIKE '%RESET_TXN_TEST%';
+COMMIT;

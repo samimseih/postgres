@@ -41,7 +41,9 @@ SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 -- New function pg_stat_statement_info, and new function
 -- and view for pg_stat_statements introduced in 1.9
 AlTER EXTENSION pg_stat_statements UPDATE TO '1.9';
-SELECT pg_get_functiondef('pg_stat_statements_info'::regproc);
+SELECT pg_get_function_arguments('pg_stat_statements_info'::regproc) =
+       'OUT entry_dealloc bigint, OUT entry_dsa_size bigint, OUT qtext_dsa_size bigint, OUT qtext_count bigint, OUT qtext_total_len bigint, OUT stats_reset timestamp with time zone'
+       AS info_args_ok;
 \d pg_stat_statements
 SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 
@@ -65,6 +67,11 @@ SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 
 -- New functions and views for pg_stat_statements in 1.13
 AlTER EXTENSION pg_stat_statements UPDATE TO '1.13';
+\d pg_stat_statements
+SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
+
+-- Functions marked PARALLEL RESTRICTED in 1.14
+AlTER EXTENSION pg_stat_statements UPDATE TO '1.14';
 \d pg_stat_statements
 SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
 

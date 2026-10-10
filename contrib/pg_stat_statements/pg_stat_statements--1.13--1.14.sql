@@ -1,9 +1,15 @@
-/* contrib/pg_stat_statements/pg_stat_statements--1.8--1.9.sql */
+/* contrib/pg_stat_statements/pg_stat_statements--1.13--1.14.sql */
 
 -- complain if script is sourced in psql, rather than via ALTER EXTENSION
-\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.9'" to load this file. \quit
+\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.14'" to load this file. \quit
 
---- Define pg_stat_statements_info
+/* Update pg_stat_statements_info with entry and query-text storage counters */
+ALTER EXTENSION pg_stat_statements DROP VIEW pg_stat_statements_info;
+ALTER EXTENSION pg_stat_statements DROP FUNCTION pg_stat_statements_info();
+
+DROP VIEW pg_stat_statements_info;
+DROP FUNCTION pg_stat_statements_info();
+
 CREATE FUNCTION pg_stat_statements_info(
     OUT entry_dealloc bigint,
     OUT entry_dsa_size bigint,
@@ -29,7 +35,7 @@ ALTER EXTENSION pg_stat_statements DROP FUNCTION pg_stat_statements(boolean);
 DROP VIEW pg_stat_statements;
 DROP FUNCTION pg_stat_statements(boolean);
 
-/* Now redefine */
+/* Now redefine with PARALLEL RESTRICTED */
 CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT userid oid,
     OUT dbid oid,
@@ -59,17 +65,41 @@ CREATE FUNCTION pg_stat_statements(IN showtext boolean,
     OUT local_blks_written int8,
     OUT temp_blks_read int8,
     OUT temp_blks_written int8,
-    OUT blk_read_time float8,
-    OUT blk_write_time float8,
+    OUT shared_blk_read_time float8,
+    OUT shared_blk_write_time float8,
+    OUT local_blk_read_time float8,
+    OUT local_blk_write_time float8,
+    OUT temp_blk_read_time float8,
+    OUT temp_blk_write_time float8,
     OUT wal_records int8,
     OUT wal_fpi int8,
-    OUT wal_bytes numeric
+    OUT wal_bytes numeric,
+    OUT wal_buffers_full int8,
+    OUT jit_functions int8,
+    OUT jit_generation_time float8,
+    OUT jit_inlining_count int8,
+    OUT jit_inlining_time float8,
+    OUT jit_optimization_count int8,
+    OUT jit_optimization_time float8,
+    OUT jit_emission_count int8,
+    OUT jit_emission_time float8,
+    OUT jit_deform_count int8,
+    OUT jit_deform_time float8,
+    OUT parallel_workers_to_launch int8,
+    OUT parallel_workers_launched int8,
+    OUT generic_plan_calls int8,
+    OUT custom_plan_calls int8,
+    OUT stats_since timestamp with time zone,
+    OUT minmax_stats_since timestamp with time zone
 )
 RETURNS SETOF record
-AS 'MODULE_PATHNAME', 'pg_stat_statements_1_9'
-LANGUAGE C STRICT VOLATILE PARALLEL SAFE;
+AS 'MODULE_PATHNAME', 'pg_stat_statements_1_14'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 CREATE VIEW pg_stat_statements AS
   SELECT * FROM pg_stat_statements(true);
 
 GRANT SELECT ON pg_stat_statements TO PUBLIC;
+
+/* Mark reset functions as PARALLEL RESTRICTED */
+ALTER FUNCTION pg_stat_statements_reset(Oid, Oid, bigint, boolean) PARALLEL RESTRICTED;

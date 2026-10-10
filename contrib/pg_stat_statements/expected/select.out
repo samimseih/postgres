@@ -394,10 +394,14 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
  t
 (1 row)
 
-SELECT dealloc FROM pg_stat_statements_info;
- dealloc 
----------
-       0
+SELECT entry_dealloc, entry_dsa_size > 0 AS entry_dsa_size_ok,
+       qtext_dsa_size > 0 AS qtext_dsa_size_ok,
+       qtext_count >= 0 AS qtext_count_ok,
+       qtext_total_len >= 0 AS qtext_total_len_ok
+FROM pg_stat_statements_info;
+ entry_dealloc | entry_dsa_size_ok | qtext_dsa_size_ok | qtext_count_ok | qtext_total_len_ok 
+---------------+-------------------+-------------------+----------------+--------------------
+             0 | t                 | t                 | t              | t
 (1 row)
 
 -- FROM [ONLY]
@@ -889,3 +893,40 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
  t
 (1 row)
 
+--
+-- reset within a transaction: entries with unflushed pending data should
+-- still be removed and not reappear in the view
+--
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+BEGIN;
+SELECT 1 AS "RESET_TXN_TEST";
+ RESET_TXN_TEST 
+----------------
+              1
+(1 row)
+
+SELECT count(*) FROM pg_stat_statements WHERE query LIKE '%RESET_TXN_TEST%';
+ count 
+-------
+     1
+(1 row)
+
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+SET LOCAL pg_stat_statements.track = none;
+SELECT count(*) FROM pg_stat_statements WHERE query LIKE '%RESET_TXN_TEST%';
+ count 
+-------
+     0
+(1 row)
+
+COMMIT;
