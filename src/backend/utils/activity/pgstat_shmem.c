@@ -1240,6 +1240,44 @@ pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid,
 	return freed;
 }
 
+static uint64
+pgstat_drop_matching_entries_from_hash(dshash_table *hash,
+									   bool (*do_drop) (PgStatShared_HashEntry *, Datum),
+									   Datum match_data)
+{
+	dshash_seq_status hstat;
+	PgStatShared_HashEntry *ps;
+	uint64		not_freed_count = 0;
+
+	/* entries are removed, take an exclusive lock */
+	dshash_seq_init(&hstat, hash, true);
+	while ((ps = dshash_seq_next(&hstat)) != NULL)
+	{
+		if (ps->dropped)
+			continue;
+
+		if (do_drop != NULL && !do_drop(ps, match_data))
+			continue;
+
+		/* delete local reference */
+		if (pgStatEntryRefHash)
+		{
+			PgStat_EntryRefHashEntry *lohashent =
+				pgstat_entry_ref_hash_lookup(pgStatEntryRefHash, ps->key);
+
+			if (lohashent)
+				pgstat_release_entry_ref(lohashent->key, lohashent->entry_ref,
+										 true);
+		}
+
+		if (!pgstat_drop_entry_internal(ps, &hstat))
+			not_freed_count++;
+	}
+	dshash_seq_term(&hstat);
+
+	return not_freed_count;
+}
+
 /*
  * Scan through the stats hashtables, dropping statistics if approved by the
  * optional do_drop() function.
@@ -1248,38 +1286,42 @@ void
 pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 							 Datum match_data)
 {
-	dshash_seq_status hstat;
-	PgStatShared_HashEntry *ps;
 	uint64		not_freed_count = 0;
 
 	for (int h = 0; h < pgStatLocal.num_var_hashes; h++)
-	{
-		/* entries are removed, take an exclusive lock */
-		dshash_seq_init(&hstat, pgStatLocal.var_hashes[h], true);
-		while ((ps = dshash_seq_next(&hstat)) != NULL)
-		{
-			if (ps->dropped)
-				continue;
+		not_freed_count +=
+			pgstat_drop_matching_entries_from_hash(pgStatLocal.var_hashes[h],
+												   do_drop, match_data);
 
-			if (do_drop != NULL && !do_drop(ps, match_data))
-				continue;
+	if (not_freed_count > 0)
+		pgstat_request_entry_refs_gc();
+}
 
-			/* delete local reference */
-			if (pgStatEntryRefHash)
-			{
-				PgStat_EntryRefHashEntry *lohashent =
-					pgstat_entry_ref_hash_lookup(pgStatEntryRefHash, ps->key);
+/*
+ * Scan through one own-hash stats kind's hashtable, dropping statistics if
+ * approved by the optional do_drop() function.
+ */
+void
+pgstat_drop_matching_entries_of_kind(PgStat_Kind kind,
+									 bool (*do_drop) (PgStatShared_HashEntry *, Datum),
+									 Datum match_data)
+{
+	const PgStat_KindInfo *kind_info;
+	uint64		not_freed_count;
 
-				if (lohashent)
-					pgstat_release_entry_ref(lohashent->key, lohashent->entry_ref,
-											 true);
-			}
+	Assert(kind >= PGSTAT_KIND_MIN && kind <= PGSTAT_KIND_MAX);
 
-			if (!pgstat_drop_entry_internal(ps, &hstat))
-				not_freed_count++;
-		}
-		dshash_seq_term(&hstat);
-	}
+	kind_info = pgstat_get_kind_info(kind);
+	if (!kind_info->own_hash)
+		elog(ERROR, "statistics kind \"%s\" does not have its own hash table",
+			 kind_info->name);
+
+	if (pgStatLocal.kind_hash[kind] == NULL)
+		return;
+
+	not_freed_count =
+		pgstat_drop_matching_entries_from_hash(pgStatLocal.kind_hash[kind],
+											   do_drop, match_data);
 
 	if (not_freed_count > 0)
 		pgstat_request_entry_refs_gc();
