@@ -12,30 +12,19 @@
  */
 #include "postgres.h"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include "common/int.h"
 #include "pg_stat_statements_internal.h"
 #include "mb/pg_wchar.h"
 #include "storage/dsm_registry.h"
-#include "storage/fd.h"
 #include "storage/s_lock.h"
 #include "utils/dsa.h"
 #include "utils/memutils.h"
-
-/*
- * Location of external query text file.
- */
-#define PGSS_TEXT_FILE	PG_STAT_TMP_DIR "/pgss_query_texts.stat"
 
 /* Read/write helpers for stats file serialization, as in pgstat.c */
 #define pgss_write_chunk(fpout, ptr, len) (fwrite(ptr, len, 1, fpout) == 1)
 #define pgss_write_chunk_s(fpout, ptr) pgss_write_chunk(fpout, ptr, sizeof(*ptr))
 #define pgss_read_chunk(fpin, ptr, len) (fread(ptr, 1, len, fpin) == (len))
 #define pgss_read_chunk_s(fpin, ptr) pgss_read_chunk(fpin, ptr, sizeof(*ptr))
-
-#define ASSUMED_LENGTH_INIT		1024	/* initial assumed mean query length */
 
 /* Backend-local pending entry */
 typedef struct PgStat_PgssPending
@@ -50,6 +39,12 @@ typedef struct pgssResetFilter
 	Oid			dbid;
 	int64		queryid;
 } pgssResetFilter;
+
+typedef struct pgssRestoredQueryText
+{
+	dsa_pointer text;
+	int			len;
+} pgssRestoredQueryText;
 
 /* Eviction victim selection */
 typedef struct pgssEvictCandidate
@@ -69,19 +64,23 @@ typedef struct pgssEvictContext
 } pgssEvictContext;
 
 int			pgss_max = 5000;	/* target number of statements to track */
+int			pgss_query_text_memory = PGSS_QUERY_TEXT_MEMORY_DEFAULT;	/* in KB */
 bool		pgss_save = true;	/* whether to save stats across shutdown */
 
 pgssSharedState *pgss_shared = NULL;
 dshash_table *pgss_hash = NULL;
 
-static char *pgss_statsfile_query_texts = NULL;
-static Size pgss_statsfile_query_texts_size = 0;
+static dsa_area *pgss_query_text_dsa = NULL;
+static pgssRestoredQueryText *pgss_restored_query_texts = NULL;
+static int	pgss_num_restored_query_texts = 0;
+static int	pgss_restored_query_text_capacity = 0;
+static bool pgss_have_restored_entries = false;
 
 static void pgss_init_shmem(void *ptr, void *arg);
 static void pgss_attach_shmem_cb(void);
-static void pgss_create_query_text_file(void);
-static bool pgss_need_query_text_gc_locked(void);
-static void pgss_reset_query_text_file_locked(void);
+static uint64 pgss_query_text_memory_limit_bytes(void);
+static bool pgss_reserve_query_text_space(int query_len);
+static bool pgss_remember_restored_query_text(dsa_pointer text, int len);
 static uint64 pgss_decay_usage(PgStatShared_Pgss *shared);
 static void pgss_flush_kind(Counters *shared, Counters *pending,
 							pgssStoreKind kind,
@@ -111,6 +110,7 @@ static bool pgss_entry_matches_filter(PgStatShared_Pgss *shared,
 									  pgssResetFilter *filter);
 static bool pgss_drop_matching_entry(PgStatShared_HashEntry *p, Datum match_data);
 static bool pgss_drop_evicted_entry(PgStatShared_HashEntry *p, Datum match_data);
+static void pgss_clear_query_text_locked(PgStatShared_Pgss *shared);
 static int	pgss_evict_candidate_objid_cmp(const void *a, const void *b);
 static int	pgss_evict_candidate_usage_cmp(const void *a, const void *b);
 static const pgssEvictCandidate *pgss_find_evict_candidate(pgssEvictContext *context,
@@ -146,24 +146,18 @@ pgss_init_shmem(void *ptr, void *arg)
 
 	pg_atomic_init_u64(&state->entry_dealloc, 0);
 	pg_atomic_init_u64(&state->entry_count, 0);
+	pg_atomic_init_u64(&state->qtext_count, 0);
+	pg_atomic_init_u64(&state->qtext_total_len, 0);
 	pg_atomic_init_u64(&state->stats_reset, (uint64) GetCurrentTimestamp());
 	pg_atomic_init_u64(&state->cur_median_usage, PGSS_USAGE_MEDIAN_INIT);
-	pg_atomic_init_u64(&state->qtext_extent, 0);
-	state->mean_query_len = ASSUMED_LENGTH_INIT;
 	LWLockInitialize(&state->entry_evict_lock,
 					 LWLockNewTrancheId("pg_stat_statements entry eviction"));
-	LWLockInitialize(&state->qtext_lock,
-					 LWLockNewTrancheId("pg_stat_statements query text"));
-
-	/* A crash may have left the temporary query text file behind. */
-	unlink(PGSS_TEXT_FILE);
-	pgss_create_query_text_file();
 }
 
 /*
  * init_backend_cb: attach to the shared state.  Runs in every process that
- * uses the cumulative statistics system, so pgss_shared is set wherever a
- * stats callback or hook can run.
+ * uses the cumulative statistics system, so pgss_shared and pgss_query_text_dsa
+ * are set wherever a stats callback or hook can run.
  */
 static void
 pgss_attach_shmem_cb(void)
@@ -175,6 +169,9 @@ pgss_attach_shmem_cb(void)
 										 sizeof(pgssSharedState),
 										 pgss_init_shmem,
 										 &found, NULL);
+
+	if (pgss_query_text_dsa == NULL)
+		pgss_query_text_dsa = GetNamedDSA("pg_stat_statements_qtext", &found);
 
 	if (pgss_hash == NULL)
 		pgss_hash = pgStatLocal.kind_hash[PGSTAT_KIND_PGSS];
@@ -196,6 +193,12 @@ pgss_shared_from_hash_entry(PgStatShared_HashEntry *p)
 		dsa_get_address(pgStatLocal.kind_dsa[PGSTAT_KIND_PGSS], p->body);
 }
 
+char *
+pgss_query_text_address(dsa_pointer query_text)
+{
+	return dsa_get_address(pgss_query_text_dsa, query_text);
+}
+
 uint64
 pgss_entry_dsa_size(void)
 {
@@ -205,6 +208,15 @@ pgss_entry_dsa_size(void)
 		return 0;
 
 	return (uint64) dsa_get_total_size(dsa);
+}
+
+uint64
+pgss_query_text_dsa_size(void)
+{
+	if (pgss_query_text_dsa == NULL)
+		return 0;
+
+	return (uint64) dsa_get_total_size(pgss_query_text_dsa);
 }
 
 void
@@ -231,447 +243,181 @@ pgss_evict_threshold(void)
 			   (uint64) pgss_max * PGSS_EVICT_THRESHOLD_PERCENT / 100);
 }
 
-bool
-pgss_admission_pressure(uint64 threshold)
+static uint64
+pgss_query_text_memory_limit_bytes(void)
 {
-	return pg_atomic_read_u64(&pgss_shared->entry_count) >= threshold;
-}
-
-static void
-pgss_create_query_text_file(void)
-{
-	FILE	   *qfile;
-
-	qfile = AllocateFile(PGSS_TEXT_FILE, PG_BINARY_W);
-	if (qfile == NULL)
-	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not create file \"%s\": %m",
-						PGSS_TEXT_FILE)));
-		return;
-	}
-
-	FreeFile(qfile);
+	return (uint64) pgss_query_text_memory * 1024;
 }
 
 bool
-pgss_store_query_text_file(const char *query, int query_len, Size *query_offset)
+pgss_admission_pressure(uint64 threshold, int needed_query_len)
 {
-	bool		stored;
+	uint64		limit = pgss_query_text_memory_limit_bytes();
+	uint64		qtext_total_len;
 
-	LWLockAcquire(&pgss_shared->qtext_lock, LW_SHARED);
-	stored = pgss_store_query_text_file_locked(query, query_len, query_offset);
-	LWLockRelease(&pgss_shared->qtext_lock);
+	qtext_total_len = pg_atomic_read_u64(&pgss_shared->qtext_total_len);
 
-	return stored;
-}
-
-bool
-pgss_store_query_text_file_locked(const char *query, int query_len,
-								  Size *query_offset)
-{
-	uint64		off64;
-	Size		off;
-	int			fd = -1;
-
-	Assert(query_offset != NULL);
-	Assert(LWLockHeldByMeInMode(&pgss_shared->qtext_lock, LW_SHARED) ||
-		   LWLockHeldByMeInMode(&pgss_shared->qtext_lock, LW_EXCLUSIVE));
-
-	if (query_len < 0)
-		return false;
-
-	off64 = pg_atomic_fetch_add_u64(&pgss_shared->qtext_extent,
-									query_len + 1);
-	off = (Size) off64;
-	*query_offset = off;
-
-	/*
-	 * Don't allow the file to grow larger than what
-	 * pgss_load_query_text_file() can theoretically handle.  This has been
-	 * seen to be reachable on 32-bit platforms.
-	 */
-	if (unlikely(off64 > MaxAllocHugeSize ||
-				 query_len >= MaxAllocHugeSize - off))
-	{
-		errno = EFBIG;			/* not quite right, but it'll do */
-		goto error;
-	}
-
-	fd = OpenTransientFile(PGSS_TEXT_FILE, O_RDWR | O_CREAT | PG_BINARY);
-	if (fd < 0)
-		goto error;
-
-	if (pg_pwrite(fd, query, query_len, off) != query_len)
-		goto error;
-	if (pg_pwrite(fd, "\0", 1, off + query_len) != 1)
-		goto error;
-
-	CloseTransientFile(fd);
-
-	return true;
-
-error:
-	ereport(LOG,
-			(errcode_for_file_access(),
-			 errmsg("could not write file \"%s\": %m",
-					PGSS_TEXT_FILE)));
-
-	if (fd >= 0)
-		CloseTransientFile(fd);
-
-	return false;
-}
-
-/*
- * Read the external query text file into a palloc'd buffer.
- *
- * Returns NULL (without throwing an error) if unable to read, eg
- * file not there or insufficient memory.
- *
- * On success, the buffer size is also returned into *buffer_size.
- */
-char *
-pgss_load_query_text_file(Size *buffer_size)
-{
-	char	   *buf;
-	int			fd;
-	struct stat stat;
-	Size		nread;
-
-	fd = OpenTransientFile(PGSS_TEXT_FILE, O_RDONLY | PG_BINARY);
-	if (fd < 0)
-	{
-		if (errno != ENOENT)
-			ereport(LOG,
-					(errcode_for_file_access(),
-					 errmsg("could not read file \"%s\": %m",
-							PGSS_TEXT_FILE)));
-		return NULL;
-	}
-
-	/* Get file length */
-	if (fstat(fd, &stat))
-	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not stat file \"%s\": %m",
-						PGSS_TEXT_FILE)));
-		CloseTransientFile(fd);
-		return NULL;
-	}
-
-	/* Allocate buffer; beware that off_t might be wider than size_t */
-	if (stat.st_size <= MaxAllocHugeSize)
-		buf = (char *) palloc_extended(stat.st_size,
-									   MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM);
-	else
-		buf = NULL;
-	if (buf == NULL)
-	{
-		ereport(LOG,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of memory"),
-				 errdetail("Could not allocate enough memory to read file \"%s\".",
-						   PGSS_TEXT_FILE)));
-		CloseTransientFile(fd);
-		return NULL;
-	}
-
-	/*
-	 * OK, slurp in the file.  Windows fails if we try to read more than
-	 * INT_MAX bytes at once, and other platforms might not like that either,
-	 * so read a very large file in 1GB segments.
-	 */
-	nread = 0;
-	while (nread < stat.st_size)
-	{
-		int			toread = Min(1024 * 1024 * 1024, stat.st_size - nread);
-
-		errno = 0;
-		if (read(fd, buf + nread, toread) != toread)
-		{
-			if (errno)
-				ereport(LOG,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m",
-								PGSS_TEXT_FILE)));
-			pfree(buf);
-			CloseTransientFile(fd);
-			return NULL;
-		}
-		nread += toread;
-	}
-
-	if (CloseTransientFile(fd) != 0)
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not close file \"%s\": %m", PGSS_TEXT_FILE)));
-
-	*buffer_size = nread;
-	return buf;
-}
-
-/*
- * Locate a query text in the file image previously read by
- * pgss_load_query_text_file().
- */
-char *
-pgss_fetch_query_text(Size query_offset, int query_len,
-					  char *buffer, Size buffer_size)
-{
-	/* File read failed? */
-	if (buffer == NULL)
-		return NULL;
-	/* Bogus offset/length? */
-	if (query_len < 0 ||
-		query_offset + query_len >= buffer_size)
-		return NULL;
-	/* As a further sanity check, make sure there's a trailing null */
-	if (buffer[query_offset + query_len] != '\0')
-		return NULL;
-	/* Looks OK */
-	return buffer + query_offset;
-}
-
-bool
-pgss_need_query_text_gc(void)
-{
-	bool		result;
-
-	LWLockAcquire(&pgss_shared->qtext_lock, LW_SHARED);
-	result = pgss_need_query_text_gc_locked();
-	LWLockRelease(&pgss_shared->qtext_lock);
-
-	return result;
+	return pg_atomic_read_u64(&pgss_shared->qtext_count) >= threshold ||
+		pg_atomic_read_u64(&pgss_shared->entry_count) >= threshold ||
+		qtext_total_len >= limit ||
+		(needed_query_len > 0 &&
+		 ((uint64) needed_query_len > limit ||
+		  (uint64) needed_query_len > limit - qtext_total_len));
 }
 
 static bool
-pgss_need_query_text_gc_locked(void)
+pgss_reserve_query_text_space(int query_len)
 {
-	Size		extent;
+	uint64		limit = pgss_query_text_memory_limit_bytes();
+	uint64		old_total;
+	uint64		new_total;
 
-	/* mean_query_len is protected by qtext_lock */
-	extent = (Size) pg_atomic_read_u64(&pgss_shared->qtext_extent);
-
-	/*
-	 * Don't proceed if file does not exceed 512 bytes per possible entry.
-	 *
-	 * Here and in the next test, 32-bit machines have overflow hazards if
-	 * pgss_max and/or mean_query_len are large.  Force the multiplications
-	 * and comparisons to be done in uint64 arithmetic to forestall trouble.
-	 */
-	if ((uint64) extent < (uint64) 512 * pgss_max)
+	if (query_len < 0 || !AllocSizeIsValid((Size) query_len + 1))
 		return false;
 
-	/*
-	 * Don't proceed if file is less than about 50% bloat.  Nothing can or
-	 * should be done in the event of unusually large query texts accounting
-	 * for file's large size.  We go to the trouble of maintaining the mean
-	 * query length in order to prevent garbage collection from thrashing
-	 * uselessly.
-	 */
-	if ((uint64) extent < (uint64) pgss_shared->mean_query_len * pgss_max * 2)
+	if ((uint64) query_len > limit)
 		return false;
 
-	return true;
+	old_total = pg_atomic_read_u64(&pgss_shared->qtext_total_len);
+	for (;;)
+	{
+		if (old_total > limit ||
+			(uint64) query_len > limit - old_total)
+			return false;
+
+		new_total = old_total + (uint64) query_len;
+		if (pg_atomic_compare_exchange_u64(&pgss_shared->qtext_total_len,
+										   &old_total, new_total))
+			return true;
+	}
+}
+
+/* Store query text in DSA, returning InvalidDsaPointer on allocation failure. */
+dsa_pointer
+pgss_store_query_text_dsa(const char *query, int query_len)
+{
+	dsa_pointer dp = InvalidDsaPointer;
+	char	   *dst;
+	Size		query_size;
+
+	if (!pgss_reserve_query_text_space(query_len))
+		return InvalidDsaPointer;
+
+	query_size = (Size) query_len + 1;
+	dp = dsa_allocate_extended(pgss_query_text_dsa, query_size, DSA_ALLOC_NO_OOM);
+
+	if (!DsaPointerIsValid(dp))
+	{
+		pg_atomic_fetch_sub_u64(&pgss_shared->qtext_total_len,
+								(uint64) query_len);
+		return InvalidDsaPointer;
+	}
+
+	dst = dsa_get_address(pgss_query_text_dsa, dp);
+	memcpy(dst, query, query_len);
+	dst[query_len] = '\0';
+	pg_atomic_fetch_add_u64(&pgss_shared->qtext_count, 1);
+
+	return dp;
 }
 
 void
-pgss_gc_query_texts(void)
+pgss_free_dsa_query_text(dsa_pointer query_text, int query_len)
 {
-	char	   *qbuffer;
-	Size		qbuffer_size;
-	FILE	   *qfile = NULL;
-	dshash_seq_status hstat;
-	PgStatShared_HashEntry *p;
-	Size		extent;
-	int			nentries;
+	if (!DsaPointerIsValid(query_text))
+		return;
 
-	LWLockAcquire(&pgss_shared->qtext_lock, LW_EXCLUSIVE);
+	Assert(query_len >= 0);
 
-	if (!pgss_need_query_text_gc_locked())
-		goto done;
+	pg_atomic_fetch_sub_u64(&pgss_shared->qtext_count, 1);
+	pg_atomic_fetch_sub_u64(&pgss_shared->qtext_total_len,
+							(uint64) query_len);
 
-	qbuffer = pgss_load_query_text_file(&qbuffer_size);
-	if (qbuffer == NULL)
-		goto gc_fail;
-
-	/*
-	 * We overwrite the query texts file in place, so as to reduce the risk of
-	 * an out-of-disk-space failure.  Since the file is guaranteed not to get
-	 * larger, this should always work on traditional filesystems; though we
-	 * could still lose on copy-on-write filesystems.
-	 */
-	qfile = AllocateFile(PGSS_TEXT_FILE, PG_BINARY_W);
-	if (qfile == NULL)
-	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": %m",
-						PGSS_TEXT_FILE)));
-		goto gc_fail;
-	}
-
-	extent = 0;
-	nentries = 0;
-
-	dshash_seq_init(&hstat, pgss_hash, false);
-	while ((p = dshash_seq_next(&hstat)) != NULL)
-	{
-		PgStatShared_Pgss *shared;
-		int			query_len;
-		char	   *qry;
-
-		if (p->dropped)
-			continue;
-
-		shared = pgss_shared_from_hash_entry(p);
-		if (pg_atomic_read_u32(&shared->entry_live) == 0)
-			continue;
-
-		LWLockAcquire(&shared->header.lock, LW_EXCLUSIVE);
-		query_len = shared->entry.query_len;
-		qry = pgss_fetch_query_text(shared->entry.query_offset,
-									query_len,
-									qbuffer,
-									qbuffer_size);
-
-		if (qry == NULL)
-		{
-			/* Trouble ... drop the text */
-			shared->entry.query_offset = 0;
-			shared->entry.query_len = -1;
-			LWLockRelease(&shared->header.lock);
-			continue;
-		}
-
-		if (fwrite(qry, 1, query_len + 1, qfile) != query_len + 1)
-		{
-			LWLockRelease(&shared->header.lock);
-			ereport(LOG,
-					(errcode_for_file_access(),
-					 errmsg("could not write file \"%s\": %m",
-							PGSS_TEXT_FILE)));
-			dshash_seq_term(&hstat);
-			goto gc_fail;
-		}
-
-		shared->entry.query_offset = extent;
-		extent += query_len + 1;
-		nentries++;
-		LWLockRelease(&shared->header.lock);
-	}
-	dshash_seq_term(&hstat);
-
-	/*
-	 * Truncate away any now-unused space.  If this fails for some odd reason,
-	 * we log it, but there's no need to fail.
-	 */
-	if (ftruncate(fileno(qfile), extent) != 0)
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not truncate file \"%s\": %m",
-						PGSS_TEXT_FILE)));
-
-	if (FreeFile(qfile))
-	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": %m",
-						PGSS_TEXT_FILE)));
-		qfile = NULL;
-		goto gc_fail;
-	}
-
-	elog(DEBUG1, "pgss gc of queries file shrunk size from " UINT64_FORMAT " to %zu",
-		 pg_atomic_read_u64(&pgss_shared->qtext_extent), extent);
-
-	pg_atomic_write_u64(&pgss_shared->qtext_extent, extent);
-	if (nentries > 0)
-		pgss_shared->mean_query_len = extent / nentries;
-	else
-		pgss_shared->mean_query_len = ASSUMED_LENGTH_INIT;
-
-	pfree(qbuffer);
-	goto done;
-
-gc_fail:
-	if (qfile)
-		FreeFile(qfile);
-	if (qbuffer)
-		pfree(qbuffer);
-
-	dshash_seq_init(&hstat, pgss_hash, false);
-	while ((p = dshash_seq_next(&hstat)) != NULL)
-	{
-		PgStatShared_Pgss *shared;
-
-		if (p->dropped)
-			continue;
-
-		shared = pgss_shared_from_hash_entry(p);
-		if (pg_atomic_read_u32(&shared->entry_live) == 0)
-			continue;
-
-		LWLockAcquire(&shared->header.lock, LW_EXCLUSIVE);
-		shared->entry.query_offset = 0;
-		shared->entry.query_len = -1;
-		LWLockRelease(&shared->header.lock);
-	}
-	dshash_seq_term(&hstat);
-
-	(void) unlink(PGSS_TEXT_FILE);
-	pgss_create_query_text_file();
-	pg_atomic_write_u64(&pgss_shared->qtext_extent, 0);
-	pgss_shared->mean_query_len = ASSUMED_LENGTH_INIT;
-
-done:
-	LWLockRelease(&pgss_shared->qtext_lock);
-}
-
-void
-pgss_reset_query_text_file(void)
-{
-	LWLockAcquire(&pgss_shared->qtext_lock, LW_EXCLUSIVE);
-	pgss_reset_query_text_file_locked();
-	LWLockRelease(&pgss_shared->qtext_lock);
+	dsa_free(pgss_query_text_dsa, query_text);
 }
 
 static void
-pgss_reset_query_text_file_locked(void)
+pgss_clear_query_text_locked(PgStatShared_Pgss *shared)
 {
-	FILE	   *qfile;
+	Assert(LWLockHeldByMeInMode(&shared->header.lock, LW_EXCLUSIVE));
 
-	Assert(LWLockHeldByMeInMode(&pgss_shared->qtext_lock, LW_EXCLUSIVE));
+	pgss_free_dsa_query_text(shared->entry.query_text, shared->entry.query_len);
+	shared->entry.query_text = InvalidDsaPointer;
+	shared->entry.query_len = 0;
+}
 
-	/*
-	 * Write new empty query file, perhaps even creating a new one to recover
-	 * if the file was missing.
-	 */
-	qfile = AllocateFile(PGSS_TEXT_FILE, PG_BINARY_W);
-	if (qfile == NULL)
+/*
+ * Attach a stored query text to an entry, replacing any existing one.
+ * The text is released instead if the entry died in the meantime.
+ */
+void
+pgss_attach_query_text(PgStatShared_Pgss *shpgss, const pgssHashKey *key,
+					   dsa_pointer query_text, int query_len, int encoding)
+{
+	Assert(DsaPointerIsValid(query_text) && query_len >= 0);
+
+	LWLockAcquire(&shpgss->header.lock, LW_EXCLUSIVE);
+
+	if (pg_atomic_read_u32(&shpgss->entry_live) == 0 ||
+		memcmp(&shpgss->entry.key, key, sizeof(pgssHashKey)) != 0)
+		pgss_free_dsa_query_text(query_text, query_len);
+	else
 	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not create file \"%s\": %m",
-						PGSS_TEXT_FILE)));
-		goto done;
+		pgss_clear_query_text_locked(shpgss);
+		shpgss->entry.query_text = query_text;
+		shpgss->entry.query_len = query_len;
+		shpgss->entry.encoding = encoding;
 	}
 
-	/* If ftruncate fails, log it, but it's not a fatal problem */
-	if (ftruncate(fileno(qfile), 0) != 0)
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not truncate file \"%s\": %m",
-						PGSS_TEXT_FILE)));
+	LWLockRelease(&shpgss->header.lock);
+}
 
-	FreeFile(qfile);
+/*
+ * Remember a query text restored from the stats file, so that it can be
+ * released if core later discards the file.
+ */
+static bool
+pgss_remember_restored_query_text(dsa_pointer text, int len)
+{
+	if (!DsaPointerIsValid(text))
+		return true;
 
-done:
-	pg_atomic_write_u64(&pgss_shared->qtext_extent, 0);
-	pgss_shared->mean_query_len = ASSUMED_LENGTH_INIT;
+	if (pgss_num_restored_query_texts >= pgss_restored_query_text_capacity)
+	{
+		int			newcapacity;
+		Size		newsize;
+
+		newcapacity = Max(pgss_restored_query_text_capacity * 2, 1024);
+		if (!AllocSizeIsValid((Size) newcapacity * sizeof(pgssRestoredQueryText)))
+			return false;
+		newsize = (Size) newcapacity * sizeof(pgssRestoredQueryText);
+		if (pgss_restored_query_texts == NULL)
+			pgss_restored_query_texts =
+				MemoryContextAllocExtended(TopMemoryContext, newsize,
+										   MCXT_ALLOC_NO_OOM);
+		else
+		{
+			pgssRestoredQueryText *newtexts;
+
+			newtexts = repalloc_extended(pgss_restored_query_texts, newsize,
+										 MCXT_ALLOC_NO_OOM);
+			if (newtexts == NULL)
+				return false;
+			pgss_restored_query_texts = newtexts;
+		}
+
+		if (pgss_restored_query_texts == NULL)
+			return false;
+
+		pgss_restored_query_text_capacity = newcapacity;
+	}
+
+	pgss_restored_query_texts[pgss_num_restored_query_texts].text = text;
+
+	pgss_restored_query_texts[pgss_num_restored_query_texts].len = len;
+	pgss_num_restored_query_texts++;
+
+	return true;
 }
 
 /*
@@ -864,7 +610,6 @@ pgss_to_serialized_data(const PgStat_HashKey *key,
 	uint64		entry_dealloc;
 	uint64		stats_reset;
 	int			qtext_len;
-	char	   *qstr = NULL;
 	bool		ok;
 
 	if (!pgss_save)
@@ -889,22 +634,10 @@ pgss_to_serialized_data(const PgStat_HashKey *key,
 		return true;
 	}
 
-	if (shpgss->entry.query_len >= 0)
-	{
-		if (pgss_statsfile_query_texts == NULL)
-			pgss_statsfile_query_texts =
-				pgss_load_query_text_file(&pgss_statsfile_query_texts_size);
-
-		qstr = pgss_fetch_query_text(shpgss->entry.query_offset,
-									 shpgss->entry.query_len,
-									 pgss_statsfile_query_texts,
-									 pgss_statsfile_query_texts_size);
-	}
-
 	usage = pg_atomic_read_u64(&shpgss->usage);
 	entry_dealloc = pg_atomic_read_u64(&pgss_shared->entry_dealloc);
 	stats_reset = pg_atomic_read_u64(&pgss_shared->stats_reset);
-	qtext_len = qstr != NULL ? shpgss->entry.query_len : -1;
+	qtext_len = DsaPointerIsValid(shpgss->entry.query_text) ? shpgss->entry.query_len : -1;
 
 	ok = pgss_write_chunk_s(statfile, &shpgss->entry.key) &&
 		pgss_write_chunk_s(statfile, &shpgss->entry.encoding) &&
@@ -916,7 +649,10 @@ pgss_to_serialized_data(const PgStat_HashKey *key,
 		pgss_write_chunk_s(statfile, &qtext_len);
 
 	if (ok && qtext_len >= 0)
-		ok = pgss_write_chunk(statfile, qstr, qtext_len + 1);
+		ok = pgss_write_chunk(statfile,
+							  dsa_get_address(pgss_query_text_dsa,
+											  shpgss->entry.query_text),
+							  qtext_len + 1);
 
 	LWLockRelease(&shpgss->header.lock);
 
@@ -934,7 +670,7 @@ pgss_from_serialized_data(const PgStat_HashKey *key,
 {
 	PgStatShared_Pgss *shpgss = (PgStatShared_Pgss *) header;
 	bool		saved_entry;
-	Size		query_offset = 0;
+	dsa_pointer dp = InvalidDsaPointer;
 	int			qtext_len;
 	uint64		entry_dealloc;
 	uint64		stats_reset;
@@ -948,6 +684,8 @@ pgss_from_serialized_data(const PgStat_HashKey *key,
 		pgstat_drop_entry(PGSTAT_KIND_PGSS, key->dboid, key->objid, false);
 		return true;
 	}
+
+	pgss_have_restored_entries = true;
 
 	if (!pgss_read_chunk_s(statfile, &shpgss->entry.key) ||
 		!pgss_read_chunk_s(statfile, &shpgss->entry.encoding) ||
@@ -971,20 +709,20 @@ pgss_from_serialized_data(const PgStat_HashKey *key,
 
 		qtext = palloc_extended((Size) qtext_len + 1, MCXT_ALLOC_NO_OOM);
 		if (qtext == NULL)
-			return false;
-
-		if (!pgss_read_chunk(statfile, qtext, qtext_len + 1))
 		{
-			pfree(qtext);
-			return false;
+			if (fseek(statfile, qtext_len + 1, SEEK_CUR) != 0)
+				return false;
 		}
-
-		if (!pgss_store_query_text_file(qtext, qtext_len, &query_offset))
+		else
 		{
+			if (!pgss_read_chunk(statfile, qtext, qtext_len + 1))
+			{
+				pfree(qtext);
+				return false;
+			}
+			dp = pgss_store_query_text_dsa(qtext, qtext_len);
 			pfree(qtext);
-			return false;
 		}
-		pfree(qtext);
 	}
 
 	/* Nobody else can see the entry yet, so plain initialization is fine. */
@@ -994,8 +732,16 @@ pgss_from_serialized_data(const PgStat_HashKey *key,
 					   PGSS_STICKY_PENDING : PGSS_STICKY_NONE);
 	pg_atomic_init_u64(&shpgss->usage, usage);
 	pg_atomic_init_u32(&shpgss->entry_live, 0);
-	shpgss->entry.query_offset = query_offset;
-	shpgss->entry.query_len = qtext_len;
+	if (DsaPointerIsValid(dp))
+	{
+		if (pgss_remember_restored_query_text(dp, qtext_len))
+		{
+			shpgss->entry.query_text = dp;
+			shpgss->entry.query_len = qtext_len;
+		}
+		else
+			pgss_free_dsa_query_text(dp, qtext_len);
+	}
 	pgss_mark_entry_live(shpgss);
 	pg_atomic_write_u64(&pgss_shared->entry_dealloc, entry_dealloc);
 	pg_atomic_write_u64(&pgss_shared->stats_reset, stats_reset);
@@ -1006,25 +752,26 @@ pgss_from_serialized_data(const PgStat_HashKey *key,
 static void
 pgss_stats_file_finish(PgStat_StatsFileOp status)
 {
-	if (pgss_statsfile_query_texts != NULL)
-	{
-		pfree(pgss_statsfile_query_texts);
-		pgss_statsfile_query_texts = NULL;
-		pgss_statsfile_query_texts_size = 0;
-	}
-
 	if (status == STATS_DISCARD && pgss_shared != NULL)
 	{
+		for (int i = 0; i < pgss_num_restored_query_texts; i++)
+			pgss_free_dsa_query_text(pgss_restored_query_texts[i].text,
+									 pgss_restored_query_texts[i].len);
+
 		pg_atomic_write_u64(&pgss_shared->entry_dealloc, 0);
 		pg_atomic_write_u64(&pgss_shared->entry_count, 0);
 		pg_atomic_write_u64(&pgss_shared->stats_reset,
 							(uint64) GetCurrentTimestamp());
 		pg_atomic_write_u64(&pgss_shared->cur_median_usage,
 							PGSS_USAGE_MEDIAN_INIT);
-		pgss_reset_query_text_file();
 	}
-	else if (status == STATS_WRITE)
-		unlink(PGSS_TEXT_FILE);
+
+	if (pgss_restored_query_texts != NULL)
+		pfree(pgss_restored_query_texts);
+	pgss_restored_query_texts = NULL;
+	pgss_num_restored_query_texts = 0;
+	pgss_restored_query_text_capacity = 0;
+	pgss_have_restored_entries = false;
 }
 
 static void
@@ -1238,7 +985,11 @@ pgss_drop_matching_entry(PgStatShared_HashEntry *p, Datum match_data)
 	LWLockAcquire(&shared->header.lock, LW_EXCLUSIVE);
 	if (pg_atomic_read_u32(&shared->entry_live) != 0 &&
 		pgss_entry_matches_filter(shared, filter))
+	{
 		dropped = pgss_mark_entry_dead(shared);
+		if (dropped)
+			pgss_clear_query_text_locked(shared);
+	}
 	LWLockRelease(&shared->header.lock);
 
 	return dropped;
@@ -1252,7 +1003,6 @@ pgss_entry_reset(Oid userid, Oid dbid, int64 queryid, bool minmax_only)
 {
 	TimestampTz stats_reset = GetCurrentTimestamp();
 	pgssResetFilter filter = {userid, dbid, queryid};
-	bool		reset_all = !userid && !dbid && !queryid;
 
 	/*
 	 * A min/max-only reset is partial, so it updates matching entries in
@@ -1296,20 +1046,15 @@ pgss_entry_reset(Oid userid, Oid dbid, int64 queryid, bool minmax_only)
 		return stats_reset;
 	}
 
-	if (reset_all)
-		LWLockAcquire(&pgss_shared->qtext_lock, LW_EXCLUSIVE);
-
 	pgstat_drop_matching_entries_of_kind(PGSTAT_KIND_PGSS,
 										 pgss_drop_matching_entry,
 										 PointerGetDatum(&filter));
 
 	/* Reset global statistics too when all entries were targeted */
-	if (reset_all)
+	if (!userid && !dbid && !queryid)
 	{
 		pg_atomic_write_u64(&pgss_shared->entry_dealloc, 0);
 		pg_atomic_write_u64(&pgss_shared->stats_reset, (uint64) stats_reset);
-		pgss_reset_query_text_file_locked();
-		LWLockRelease(&pgss_shared->qtext_lock);
 	}
 
 	return stats_reset;
@@ -1376,7 +1121,11 @@ pgss_drop_evicted_entry(PgStatShared_HashEntry *p, Datum match_data)
 	if (pg_atomic_read_u32(&p->generation) == candidate->generation &&
 		pg_atomic_read_u32(&shared->entry_live) != 0 &&
 		memcmp(&shared->entry.key, &candidate->key, sizeof(pgssHashKey)) == 0)
+	{
 		dropped = pgss_mark_entry_dead(shared);
+		if (dropped)
+			pgss_clear_query_text_locked(shared);
+	}
 	LWLockRelease(&shared->header.lock);
 
 	return dropped;
@@ -1385,23 +1134,33 @@ pgss_drop_evicted_entry(PgStatShared_HashEntry *p, Datum match_data)
 /*
  * Decay the usage of all live entries, then drop the least-used ones.
  *
- * The number of victims is what it takes to bring live entries back to their
- * target, capped at PGSS_EVICT_PASS_PERCENT of the live entries, with a small
- * floor, so that one backend never has to pay for a huge pass (e.g. after
- * pgss_max was lowered); further misses will finish the job.
+ * The number of victims is what it takes to bring retained query texts and
+ * live entries back to their targets, capped at PGSS_EVICT_PASS_PERCENT of
+ * the live entries, with a small floor, so that one backend never has to pay
+ * for a huge pass (e.g. after pgss_max was lowered); further misses will
+ * finish the job.
  */
 void
-pgss_evict_for_entry(void)
+pgss_evict_for_entry(int needed_query_len)
 {
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *p;
 	pgssEvictCandidate *candidates = NULL;
 	pgssEvictContext context;
 	uint64		entry_victims;
+	uint64		freed_query_text = 0;
 	uint64		live_entry_count;
 	uint64		max_candidates;
+	uint64		qtext_bytes_to_free = 0;
+	uint64		qtext_bytes_needed = 0;
+	uint64		qtext_count;
+	uint64		qtext_victims;
+	uint64		qtext_memory;
+	uint64		qtext_total_len;
 	uint64		threshold;
 	uint64		victim_count;
+	bool		query_text_fits = true;
+	int			byte_victims = 0;
 	int			first_text;
 	int			capacity;
 	int			target;
@@ -1413,8 +1172,17 @@ pgss_evict_for_entry(void)
 		return;
 
 	threshold = pgss_evict_threshold();
+	qtext_memory = pgss_query_text_memory_limit_bytes();
+	if (needed_query_len > 0)
+		qtext_bytes_needed = (uint64) needed_query_len;
+	query_text_fits = qtext_bytes_needed <= qtext_memory;
+	qtext_count = pg_atomic_read_u64(&pgss_shared->qtext_count);
+	qtext_total_len = pg_atomic_read_u64(&pgss_shared->qtext_total_len);
 	live_entry_count = pg_atomic_read_u64(&pgss_shared->entry_count);
-	if (live_entry_count < threshold)
+	if (qtext_count < threshold && live_entry_count < threshold &&
+		qtext_total_len < qtext_memory &&
+		(!query_text_fits ||
+		 qtext_bytes_needed <= qtext_memory - qtext_total_len))
 		goto done;
 	if (live_entry_count == 0)
 		goto done;
@@ -1476,7 +1244,8 @@ pgss_evict_for_entry(void)
 		candidates[ncandidates].generation =
 			pg_atomic_read_u32(&p->generation);
 		candidates[ncandidates].key = shared->entry.key;
-		candidates[ncandidates].has_query_text = shared->entry.query_len >= 0;
+		candidates[ncandidates].has_query_text =
+			DsaPointerIsValid(shared->entry.query_text);
 		candidates[ncandidates].query_len =
 			candidates[ncandidates].has_query_text ? shared->entry.query_len : 0;
 		LWLockRelease(&shared->header.lock);
@@ -1505,10 +1274,38 @@ pgss_evict_for_entry(void)
 
 	entry_victims = live_entry_count > (uint64) pgss_max ?
 		live_entry_count - (uint64) pgss_max : 0;
-	victim_count = entry_victims;
+	qtext_victims = qtext_count > (uint64) pgss_max ?
+		qtext_count - (uint64) pgss_max : 0;
+	victim_count = Max(qtext_victims, entry_victims);
+
+	if (query_text_fits &&
+		(qtext_total_len >= qtext_memory ||
+		 qtext_bytes_needed > qtext_memory - qtext_total_len))
+	{
+		if (qtext_total_len >= qtext_memory)
+			qtext_bytes_to_free =
+				qtext_total_len - qtext_memory + qtext_bytes_needed;
+		else
+			qtext_bytes_to_free =
+				qtext_bytes_needed - (qtext_memory - qtext_total_len);
+		for (byte_victims = 0; byte_victims < ncandidates; byte_victims++)
+		{
+			if (candidates[byte_victims].has_query_text &&
+				candidates[byte_victims].query_len > 0)
+				freed_query_text += candidates[byte_victims].query_len;
+			if (freed_query_text >= qtext_bytes_to_free)
+			{
+				byte_victims++;
+				break;
+			}
+		}
+		victim_count = Max(victim_count, (uint64) byte_victims);
+	}
 
 	target = (int) Min(victim_count, (uint64) ncandidates);
 	target = Min(target, Max(10, ncandidates * PGSS_EVICT_PASS_PERCENT / 100));
+	if (qtext_bytes_to_free > 0)
+		target = Max(target, Min(byte_victims, ncandidates));
 	if (target == 0)
 		goto done;
 
@@ -1524,8 +1321,8 @@ pgss_evict_for_entry(void)
 
 	pg_atomic_fetch_add_u64(&pgss_shared->entry_dealloc, 1);
 
-	/* The external query text file may now contain orphaned texts. */
-	pgss_gc_query_texts();
+	/* Give freed query text memory back to the OS when possible */
+	dsa_trim(pgss_query_text_dsa);
 
 done:
 	if (candidates)

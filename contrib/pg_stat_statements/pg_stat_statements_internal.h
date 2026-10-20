@@ -20,6 +20,7 @@
 #include "nodes/queryjumble.h"
 #include "pgstat.h"
 #include "storage/lwlock.h"
+#include "utils/dsa.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
 
@@ -57,11 +58,13 @@ typedef enum pgssStickyState
 }			pgssStickyState;
 
 /*
- * Eviction starts once entries exceed pgss_max by this much, and never evicts
- * more than this fraction of the live entries in one pass.
+ * Eviction starts once retained query texts or entries exceed pgss_max by
+ * this much, and never evicts more than this fraction of the live entries in
+ * one pass.
  */
 #define PGSS_EVICT_THRESHOLD_PERCENT	110
 #define PGSS_EVICT_PASS_PERCENT		10
+#define PGSS_QUERY_TEXT_MEMORY_DEFAULT	4096
 
 /*
  * Extra slots for arrays sized from the live-entry gauge.  Entries can be
@@ -165,18 +168,14 @@ typedef struct Counters
 } Counters;
 
 /*
- * Statistics per statement
- *
- * Note: in event of a failure in garbage collection of the query text file,
- * we reset query_offset to zero and query_len to -1.  This will be seen as
- * an invalid state by pgss_fetch_query_text().
+ * Statistics per statement.
  */
 typedef struct pgssEntry
 {
 	pgssHashKey key;			/* hash key of entry */
 	Counters	counters;		/* the statistics for this query */
-	Size		query_offset;	/* query text offset in external file */
-	int			query_len;		/* # of valid bytes in query string, or -1 */
+	dsa_pointer query_text;		/* query text, or InvalidDsaPointer */
+	int			query_len;		/* # of valid bytes in query text */
 	int			encoding;		/* query text encoding */
 	TimestampTz stats_since;	/* timestamp of entry allocation */
 	TimestampTz minmax_stats_since; /* timestamp of last min/max values reset */
@@ -207,12 +206,11 @@ typedef struct pgssSharedState
 {
 	pg_atomic_uint64 entry_dealloc; /* # of entry eviction passes */
 	pg_atomic_uint64 entry_count;	/* # of live entries */
+	pg_atomic_uint64 qtext_count;	/* # of retained query texts */
+	pg_atomic_uint64 qtext_total_len;	/* logical bytes of query text */
 	pg_atomic_uint64 stats_reset;	/* timestamp with all stats reset */
 	pg_atomic_uint64 cur_median_usage;	/* current median usage of entries */
-	pg_atomic_uint64 qtext_extent;	/* current extent of query file */
-	Size		mean_query_len; /* current mean entry text length */
 	LWLock		entry_evict_lock;	/* serializes entry eviction */
-	LWLock		qtext_lock;		/* protects external query text file */
 } pgssSharedState;
 
 /* Local copy of an entry, for pg_stat_statements_internal() */
@@ -228,6 +226,7 @@ typedef struct pgssViewRow
 } pgssViewRow;
 
 extern int	pgss_max;
+extern int	pgss_query_text_memory;
 extern bool pgss_save;
 extern pgssSharedState *pgss_shared;
 extern dshash_table *pgss_hash;
@@ -235,11 +234,19 @@ extern dshash_table *pgss_hash;
 extern void pgss_register_kind(void);
 extern void pgss_require_ready(void);
 extern PgStatShared_Pgss *pgss_shared_from_hash_entry(PgStatShared_HashEntry *p);
+extern char *pgss_query_text_address(dsa_pointer query_text);
 extern void pgss_mark_entry_live(PgStatShared_Pgss *shared);
 extern uint64 pgss_entry_dsa_size(void);
+extern uint64 pgss_query_text_dsa_size(void);
 extern uint64 pgss_evict_threshold(void);
-extern bool pgss_admission_pressure(uint64 threshold);
-extern void pgss_evict_for_entry(void);
+extern bool pgss_admission_pressure(uint64 threshold, int needed_query_len);
+extern void pgss_evict_for_entry(int needed_query_len);
+extern void pgss_free_dsa_query_text(dsa_pointer query_text, int query_len);
+extern dsa_pointer pgss_store_query_text_dsa(const char *query, int query_len);
+extern void pgss_attach_query_text(PgStatShared_Pgss *shpgss,
+								   const pgssHashKey *key,
+								   dsa_pointer query_text,
+								   int query_len, int encoding);
 extern TimestampTz pgss_entry_reset(Oid userid, Oid dbid, int64 queryid,
 									bool minmax_only);
 extern void pgss_entry_accumulate(PgStat_EntryRef *entry_ref,
@@ -251,16 +258,6 @@ extern void pgss_entry_accumulate(PgStat_EntryRef *entry_ref,
 								  int parallel_workers_to_launch,
 								  int parallel_workers_launched,
 								  PlannedStmtOrigin planOrigin);
-extern bool pgss_store_query_text_file(const char *query, int query_len,
-									   Size *query_offset);
-extern bool pgss_store_query_text_file_locked(const char *query, int query_len,
-											  Size *query_offset);
-extern char *pgss_load_query_text_file(Size *buffer_size);
-extern char *pgss_fetch_query_text(Size query_offset, int query_len,
-								   char *buffer, Size buffer_size);
-extern bool pgss_need_query_text_gc(void);
-extern void pgss_gc_query_texts(void);
-extern void pgss_reset_query_text_file(void);
 
 static inline bool
 pgss_entry_ref_is_dropped(PgStat_EntryRef *entry_ref)

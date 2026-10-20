@@ -132,7 +132,9 @@ DROP TABLE pgss_a, pgss_b CASCADE;
 SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 SELECT dealloc, entry_count >= 0 AS entry_count_ok,
        entry_dsa_size > 0 AS entry_dsa_size_ok,
-       stats_reset IS NOT NULL AS stats_reset_ok
+       qtext_dsa_size > 0 AS qtext_dsa_size_ok,
+       qtext_count >= 0 AS qtext_count_ok,
+       qtext_total_len >= 0 AS qtext_total_len_ok
 FROM pg_stat_statements_info;
 
 -- FROM [ONLY]

@@ -396,11 +396,13 @@ SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 SELECT dealloc, entry_count >= 0 AS entry_count_ok,
        entry_dsa_size > 0 AS entry_dsa_size_ok,
-       stats_reset IS NOT NULL AS stats_reset_ok
+       qtext_dsa_size > 0 AS qtext_dsa_size_ok,
+       qtext_count >= 0 AS qtext_count_ok,
+       qtext_total_len >= 0 AS qtext_total_len_ok
 FROM pg_stat_statements_info;
- dealloc | entry_count_ok | entry_dsa_size_ok | stats_reset_ok 
----------+----------------+-------------------+----------------
-       0 | t              | t                 | t
+ dealloc | entry_count_ok | entry_dsa_size_ok | qtext_dsa_size_ok | qtext_count_ok | qtext_total_len_ok 
+---------+----------------+-------------------+-------------------+----------------+--------------------
+       0 | t              | t                 | t                 | t              | t
 (1 row)
 
 -- FROM [ONLY]

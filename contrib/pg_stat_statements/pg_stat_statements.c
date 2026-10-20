@@ -13,10 +13,8 @@
  *
  * To facilitate presenting entries to users, we create "representative" query
  * strings in which constants are replaced with parameter symbols ($n), to
- * make it clearer what a normalized entry can represent.  To save on shared
- * memory, and to avoid having to truncate oversized query strings, we store
- * these strings in a temporary external query-texts file.  Offsets into this
- * file are kept in pgstat entries.
+ * make it clearer what a normalized entry can represent.  The strings live
+ * in a dedicated DSA area and pgstat entries keep their DSA pointers.
  *
  * Note about locking issues: an entry's metadata (key, query text pointer,
  * timestamps) and its counters are protected by the entry's pgstat LWLock.
@@ -272,6 +270,19 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
+
+	DefineCustomIntVariable("pg_stat_statements.query_text_memory",
+							"Sets the maximum amount of query text kept by pg_stat_statements.",
+							"New statement entries are not admitted while this limit is reached.",
+							&pgss_query_text_memory,
+							PGSS_QUERY_TEXT_MEMORY_DEFAULT,
+							1,
+							MAX_KILOBYTES,
+							PGC_SIGHUP,
+							GUC_UNIT_KB,
+							NULL,
+							NULL,
+							NULL);
 
 	MarkGUCPrefixReserved("pg_stat_statements");
 
@@ -752,13 +763,11 @@ pgss_store(const char *query, int64 queryId,
 	uint64		objid;
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Pgss *shared;
+	dsa_pointer query_text = InvalidDsaPointer;
 	const char *stored_query = NULL;
 	char	   *norm_query = NULL;
-	Size		query_offset = 0;
 	int			stored_query_len = 0;
 	bool		created_entry = false;
-	bool		qtext_lock_held = false;
-	bool		do_query_text_gc = false;
 
 	Assert(query != NULL);
 
@@ -789,53 +798,31 @@ pgss_store(const char *query, int64 queryId,
 	{
 		uint64		threshold;
 
+		stored_query_len = query_len;
+		stored_query = pgss_prepare_query_text(query, query_location,
+											   &stored_query_len, jstate,
+											   &norm_query);
+
 		/*
 		 * Make room first.  pgss_max is a target, with admission allowed up
-		 * to the eviction threshold.  Drop this observation if entry pressure
-		 * remains after eviction.
+		 * to the eviction threshold.  Drop this observation if entry, query
+		 * text, or query text memory pressure remains after eviction.
 		 */
 		threshold = pgss_evict_threshold();
-		if (pgss_admission_pressure(threshold))
-			pgss_evict_for_entry();
+		if (pgss_admission_pressure(threshold, stored_query_len))
+			pgss_evict_for_entry(stored_query_len);
 
-		if (pgss_admission_pressure(threshold))
-			return;
+		if (pgss_admission_pressure(threshold, stored_query_len))
+			goto done;
 
 		entry_ref = pgstat_get_entry_ref(PGSTAT_KIND_PGSS, PGSS_STATS_DBOID,
 										 objid, true, &created_entry);
-		if (!entry_ref)
-			goto done;
-
-		if (created_entry)
-		{
-			stored_query_len = query_len;
-			stored_query = pgss_prepare_query_text(query, query_location,
-												   &stored_query_len, jstate,
-												   &norm_query);
-
-			LWLockAcquire(&pgss_shared->qtext_lock, LW_SHARED);
-			qtext_lock_held = true;
-
-			if (pgss_entry_ref_is_dropped(entry_ref))
-				goto done;
-
-			if (!pgss_store_query_text_file_locked(stored_query,
-												   stored_query_len,
-												   &query_offset))
-			{
-				LWLockRelease(&pgss_shared->qtext_lock);
-				qtext_lock_held = false;
-				if (!pgstat_drop_entry(PGSTAT_KIND_PGSS, PGSS_STATS_DBOID,
-									   objid, true))
-					pgstat_request_entry_refs_gc();
-				entry_ref = NULL;
-				goto done;
-			}
-		}
 	}
 
 	if (!entry_ref)
+	{
 		goto done;
+	}
 
 	shared = (PgStatShared_Pgss *) entry_ref->shared_stats;
 
@@ -849,40 +836,87 @@ pgss_store(const char *query, int64 queryId,
 
 	if (created_entry)
 	{
-		/*
-		 * The body is zero-filled by core.  Other backends can already see
-		 * the entry, so use plain atomic writes, not initialization, and do
-		 * not mark it live until the metadata is complete.
-		 */
-		pgstat_lock_entry(entry_ref, false);
-		shared->entry.key = key;
-		shared->entry.stats_since = GetCurrentTimestamp();
-		shared->entry.minmax_stats_since = shared->entry.stats_since;
-		pg_atomic_write_u32(&shared->sticky,
-							jstate != NULL ? PGSS_STICKY_PENDING :
-							PGSS_STICKY_NONE);
-		pg_atomic_write_u64(&shared->usage,
-							jstate != NULL ?
-							pg_atomic_read_u64(&pgss_shared->cur_median_usage) :
-							PGSS_USAGE_ONE);
-		shared->entry.query_offset = query_offset;
-		shared->entry.query_len = stored_query_len;
-		shared->entry.encoding = GetDatabaseEncoding();
-		pgss_mark_entry_live(shared);
-		pgstat_unlock_entry(entry_ref);
-		LWLockRelease(&pgss_shared->qtext_lock);
-		qtext_lock_held = false;
-		do_query_text_gc = true;
+		volatile dsa_pointer cleanup_query_text = InvalidDsaPointer;
+		bool		drop_created_entry = false;
+		volatile bool entry_locked = false;
+		bool		skip_created_entry = false;
+
+		PG_TRY();
+		{
+			query_text = pgss_store_query_text_dsa(stored_query,
+												   stored_query_len);
+			cleanup_query_text = query_text;
+			if (!DsaPointerIsValid(query_text))
+				drop_created_entry = true;
+			else
+			{
+				/*
+				 * The body is zero-filled by core.  Other backends can
+				 * already see the entry, so use plain atomic writes, not
+				 * initialization, and do not mark it live until the metadata
+				 * is complete.
+				 */
+				pgstat_lock_entry(entry_ref, false);
+				entry_locked = true;
+				if (pgss_entry_ref_is_dropped(entry_ref))
+					skip_created_entry = true;
+				else
+				{
+					shared->entry.key = key;
+					shared->entry.stats_since = GetCurrentTimestamp();
+					shared->entry.minmax_stats_since =
+						shared->entry.stats_since;
+					pg_atomic_write_u32(&shared->sticky,
+										jstate != NULL ? PGSS_STICKY_PENDING :
+										PGSS_STICKY_NONE);
+					pg_atomic_write_u64(&shared->usage,
+										jstate != NULL ?
+										pg_atomic_read_u64(&pgss_shared->cur_median_usage) :
+										PGSS_USAGE_ONE);
+					shared->entry.query_text = query_text;
+					shared->entry.query_len = stored_query_len;
+					shared->entry.encoding = GetDatabaseEncoding();
+					query_text = InvalidDsaPointer;
+					cleanup_query_text = InvalidDsaPointer;
+					pgss_mark_entry_live(shared);
+				}
+				pgstat_unlock_entry(entry_ref);
+				entry_locked = false;
+			}
+		}
+		PG_CATCH();
+		{
+			if (entry_locked)
+				pgstat_unlock_entry(entry_ref);
+			if (DsaPointerIsValid(cleanup_query_text))
+				pgss_free_dsa_query_text((dsa_pointer) cleanup_query_text,
+										 stored_query_len);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		if (drop_created_entry)
+		{
+			if (!pgstat_drop_entry(PGSTAT_KIND_PGSS, PGSS_STATS_DBOID,
+								   objid, true))
+				pgstat_request_entry_refs_gc();
+			entry_ref = NULL;
+			goto done;
+		}
+		if (skip_created_entry)
+			goto done;
 	}
 	else if (entry_ref->pending == NULL)
 	{
 		bool		metadata_valid;
 		bool		key_matches;
+		bool		has_query_text;
 
 		pgstat_lock_entry_shared(entry_ref, false);
 		metadata_valid = (shared->entry.stats_since != 0);
 		key_matches = metadata_valid &&
 			memcmp(&shared->entry.key, &key, sizeof(pgssHashKey)) == 0;
+		has_query_text = DsaPointerIsValid(shared->entry.query_text);
 		pgstat_unlock_entry(entry_ref);
 
 		if (!metadata_valid)
@@ -897,12 +931,40 @@ pgss_store(const char *query, int64 queryId,
 		 */
 		if (!key_matches)
 			goto done;
-	}
 
-	if (qtext_lock_held)
-	{
-		LWLockRelease(&pgss_shared->qtext_lock);
-		qtext_lock_held = false;
+		/* Query text is best-effort; retry if an earlier attempt failed. */
+		if (!has_query_text)
+		{
+			if (!DsaPointerIsValid(query_text))
+			{
+				uint64		threshold;
+
+				if (stored_query == NULL)
+				{
+					stored_query_len = query_len;
+					stored_query = pgss_prepare_query_text(query,
+														   query_location,
+														   &stored_query_len,
+														   jstate,
+														   &norm_query);
+				}
+
+				threshold = pgss_evict_threshold();
+				if (pgss_admission_pressure(threshold, stored_query_len))
+					pgss_evict_for_entry(stored_query_len);
+
+				if (!pgss_admission_pressure(threshold, stored_query_len))
+					query_text = pgss_store_query_text_dsa(stored_query,
+														   stored_query_len);
+			}
+
+			if (DsaPointerIsValid(query_text))
+			{
+				pgss_attach_query_text(shared, &key, query_text,
+									   stored_query_len, GetDatabaseEncoding());
+				query_text = InvalidDsaPointer;
+			}
+		}
 	}
 
 	/* Increment the counts, except when jstate is not NULL */
@@ -916,13 +978,10 @@ pgss_store(const char *query, int64 queryId,
 	}
 
 done:
-	if (qtext_lock_held)
-		LWLockRelease(&pgss_shared->qtext_lock);
+	if (DsaPointerIsValid(query_text))
+		pgss_free_dsa_query_text(query_text, stored_query_len);
 	if (norm_query)
 		pfree(norm_query);
-
-	if (do_query_text_gc && pgss_need_query_text_gc())
-		pgss_gc_query_texts();
 }
 
 /*
@@ -1124,8 +1183,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 	PgStatShared_HashEntry *p;
 	Oid			userid = GetUserId();
 	bool		is_allowed_role;
-	char	   *qbuffer = NULL;
-	Size		qbuffer_size = 0;
 	pgssViewRow *rows;
 	int			nrows;
 	int			maxrows;
@@ -1212,12 +1269,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 						PGSS_ENTRY_SCAN_HEADROOM, INT_MAX / 2);
 	rows = palloc_array(pgssViewRow, maxrows);
 
-	if (showtext)
-	{
-		LWLockAcquire(&pgss_shared->qtext_lock, LW_EXCLUSIVE);
-		qbuffer = pgss_load_query_text_file(&qbuffer_size);
-	}
-
 	dshash_seq_init(&hstat, pgss_hash, false);
 	while ((p = dshash_seq_next(&hstat)) != NULL)
 	{
@@ -1258,33 +1309,34 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		row->minmax_stats_since = shared->entry.minmax_stats_since;
 		row->encoding = shared->entry.encoding;
 		row->counters = shared->entry.counters;
-		if (showtext && shared->entry.query_len >= 0 &&
+		if (showtext && DsaPointerIsValid(shared->entry.query_text) &&
 			(is_allowed_role || shared->entry.key.userid == userid))
 		{
 			Size		query_size;
-			char	   *qstr;
 
 			row->query_len = shared->entry.query_len;
-			qstr = pgss_fetch_query_text(shared->entry.query_offset,
-										 row->query_len,
-										 qbuffer,
-										 qbuffer_size);
-			if (qstr != NULL)
+			if (row->query_len < 0 ||
+				!AllocSizeIsValid((Size) row->query_len + 1))
 			{
-				query_size = (Size) row->query_len + 1;
-				row->query = palloc_extended(query_size, MCXT_ALLOC_NO_OOM);
-				if (row->query == NULL)
-				{
-					LWLockRelease(&shared->header.lock);
-					dshash_seq_term(&hstat);
-					if (showtext)
-						LWLockRelease(&pgss_shared->qtext_lock);
-					ereport(ERROR,
-							(errcode(ERRCODE_OUT_OF_MEMORY),
-							 errmsg("out of memory")));
-				}
-				memcpy(row->query, qstr, row->query_len + 1);
+				LWLockRelease(&shared->header.lock);
+				dshash_seq_term(&hstat);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("query text is too long")));
 			}
+			query_size = (Size) row->query_len + 1;
+			row->query = palloc_extended(query_size, MCXT_ALLOC_NO_OOM);
+			if (row->query == NULL)
+			{
+				LWLockRelease(&shared->header.lock);
+				dshash_seq_term(&hstat);
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("out of memory")));
+			}
+			memcpy(row->query,
+				   pgss_query_text_address(shared->entry.query_text),
+				   row->query_len + 1);
 		}
 		LWLockRelease(&shared->header.lock);
 
@@ -1300,8 +1352,6 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		nrows++;
 	}
 	dshash_seq_term(&hstat);
-	if (showtext)
-		LWLockRelease(&pgss_shared->qtext_lock);
 
 	for (int r = 0; r < nrows; r++)
 	{
@@ -1482,14 +1532,12 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		if (row->query)
 			pfree(row->query);
 	}
-	if (qbuffer)
-		pfree(qbuffer);
 	pfree(rows);
 }
 
 /* Number of output arguments (columns) for pg_stat_statements_info */
 #define PG_STAT_STATEMENTS_INFO_COLS_V1_9	2
-#define PG_STAT_STATEMENTS_INFO_COLS		4	/* maximum of above */
+#define PG_STAT_STATEMENTS_INFO_COLS		7	/* maximum of above */
 
 /*
  * Return statistics of pg_stat_statements.
@@ -1522,7 +1570,12 @@ pg_stat_statements_info(PG_FUNCTION_ARGS)
 			values[1] = Int64GetDatum((int64)
 									  pg_atomic_read_u64(&pgss_shared->entry_count));
 			values[2] = Int64GetDatum((int64) pgss_entry_dsa_size());
-			values[3] = TimestampTzGetDatum(stats_reset);
+			values[3] = Int64GetDatum((int64) pgss_query_text_dsa_size());
+			values[4] = Int64GetDatum((int64)
+									  pg_atomic_read_u64(&pgss_shared->qtext_count));
+			values[5] = Int64GetDatum((int64)
+									  pg_atomic_read_u64(&pgss_shared->qtext_total_len));
+			values[6] = TimestampTzGetDatum(stats_reset);
 			break;
 		default:
 			elog(ERROR, "incorrect number of output arguments");

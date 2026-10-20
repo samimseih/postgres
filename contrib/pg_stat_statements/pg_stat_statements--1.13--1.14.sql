@@ -3,7 +3,7 @@
 -- complain if script is sourced in psql, rather than via ALTER EXTENSION
 \echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.14'" to load this file. \quit
 
-/* Update pg_stat_statements_info with entry storage counters */
+/* Update pg_stat_statements_info with entry and query-text storage counters */
 ALTER EXTENSION pg_stat_statements DROP VIEW pg_stat_statements_info;
 ALTER EXTENSION pg_stat_statements DROP FUNCTION pg_stat_statements_info();
 
@@ -14,6 +14,9 @@ CREATE FUNCTION pg_stat_statements_info(
     OUT dealloc bigint,
     OUT entry_count bigint,
     OUT entry_dsa_size bigint,
+    OUT qtext_dsa_size bigint,
+    OUT qtext_count bigint,
+    OUT qtext_total_len bigint,
     OUT stats_reset timestamp with time zone
 )
 RETURNS record

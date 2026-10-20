@@ -545,13 +545,16 @@ AlTER EXTENSION pg_stat_statements UPDATE TO '1.14';
  minmax_stats_since         | timestamp with time zone |           |          | 
 
 \d pg_stat_statements_info
-                   View "public.pg_stat_statements_info"
-     Column     |           Type           | Collation | Nullable | Default 
-----------------+--------------------------+-----------+----------+---------
- dealloc        | bigint                   |           |          | 
- entry_count    | bigint                   |           |          | 
- entry_dsa_size | bigint                   |           |          | 
- stats_reset    | timestamp with time zone |           |          | 
+                    View "public.pg_stat_statements_info"
+     Column      |           Type           | Collation | Nullable | Default 
+-----------------+--------------------------+-----------+----------+---------
+ dealloc         | bigint                   |           |          | 
+ entry_count     | bigint                   |           |          | 
+ entry_dsa_size  | bigint                   |           |          | 
+ qtext_dsa_size  | bigint                   |           |          | 
+ qtext_count     | bigint                   |           |          | 
+ qtext_total_len | bigint                   |           |          | 
+ stats_reset     | timestamp with time zone |           |          | 
 
 SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
  has_data 
