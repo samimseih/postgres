@@ -907,15 +907,18 @@ calls | 2
 
     <listitem>
      <para>
-      <varname>pg_stat_statements.max</varname> is the maximum number of
-      statements tracked by the module (i.e., the maximum number of rows
-      in the <structname>pg_stat_statements</structname> view).  If more distinct
-      statements than that are observed, information about the least-executed
-      statements is discarded.  The number of times such information was
+      <varname>pg_stat_statements.max</varname> is the target number
+      of statements tracked by the module (i.e., the target number of rows in
+      the <structname>pg_stat_statements</structname> view).  It is not a
+      strict limit; if more distinct statements than that target are observed,
+      information about the least-executed statements is discarded to move
+      back toward the target.  The number of times such information was
       discarded can be seen in the
       <structname>pg_stat_statements_info</structname> view.
       The default value is 5000.
-      This parameter can only be set at server start.
+      This parameter can only be set in the <filename>postgresql.conf</filename>
+      file or on the server command line.  Changes take effect after
+      configuration reload.
      </para>
     </listitem>
    </varlistentry>
@@ -995,9 +998,10 @@ calls | 2
     <listitem>
      <para>
       <varname>pg_stat_statements.save</varname> specifies whether to
-      save statement statistics across server shutdowns.
-      If it is <literal>off</literal> then statistics are not saved at
-      shutdown nor reloaded at server start.
+      save representative query texts across server shutdowns.
+      Statement statistics are saved by the cumulative statistics system
+      regardless of this setting.  If it is <literal>off</literal>, then
+      statistics are reloaded at server start without their saved query texts.
       The default value is <literal>on</literal>.
       This parameter can only be set in the <filename>postgresql.conf</filename>
       file or on the server command line.
@@ -1005,13 +1009,6 @@ calls | 2
     </listitem>
    </varlistentry>
   </variablelist>
-
-  <para>
-   The module requires additional shared memory proportional to
-   <varname>pg_stat_statements.max</varname>.  Note that this
-   memory is consumed whenever the module is loaded, even if
-   <varname>pg_stat_statements.track</varname> is set to <literal>none</literal>.
-  </para>
 
   <para>
    These parameters must be set in <filename>postgresql.conf</filename>.

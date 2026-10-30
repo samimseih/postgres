@@ -4125,9 +4125,13 @@ pgsa_writer_context
 pgsocket
 pgsql_thing_t
 pgssEntry
+pgssEntryDealloc
 pgssGlobalStats
 pgssHashKey
+pgssPendingEntry
 pgssQueryState
+pgssResetMatch
+pgssSharedEntry
 pgssSharedState
 pgssStoreKind
 pgssVersion
