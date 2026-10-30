@@ -474,4 +474,30 @@ SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
  t
 (1 row)
 
+-- Before 1.14, these functions are PARALLEL SAFE but refuse to run in a worker
+SET max_parallel_workers_per_gather = 2;
+SET debug_parallel_query = on;
+SELECT count(*) > 0 AS has_data FROM pg_stat_statements;
+ERROR:  cannot read pg_stat_statements during a parallel operation
+HINT:  Update the extension with ALTER EXTENSION pg_stat_statements UPDATE.
+CONTEXT:  parallel worker
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
+ERROR:  cannot reset pg_stat_statements during a parallel operation
+HINT:  Update the extension with ALTER EXTENSION pg_stat_statements UPDATE.
+CONTEXT:  parallel worker
+RESET debug_parallel_query;
+RESET max_parallel_workers_per_gather;
+-- pg_stat_statements functions restricted to the leader in parallel plans
+AlTER EXTENSION pg_stat_statements UPDATE TO '1.14';
+SELECT oid::regprocedure, proparallel
+FROM pg_proc
+WHERE oid IN ('pg_stat_statements(boolean)'::regprocedure,
+              'pg_stat_statements_reset(oid, oid, bigint, boolean)'::regprocedure)
+ORDER BY oid::regprocedure::text;
+                       oid                        | proparallel 
+--------------------------------------------------+-------------
+ pg_stat_statements(boolean)                      | r
+ pg_stat_statements_reset(oid,oid,bigint,boolean) | r
+(2 rows)
+
 DROP EXTENSION pg_stat_statements;
