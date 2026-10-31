@@ -831,6 +831,23 @@ pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref,
 }
 
 /*
+ * Release a local reference to an entry, unless it has pending stats.
+ * Returns true if the reference was released, in which case it must not be
+ * used anymore.
+ */
+bool
+pgstat_release_entry_ref_if_unused(PgStat_EntryRef *entry_ref)
+{
+	Assert(entry_ref->shared_entry != NULL);
+
+	if (entry_ref->pending != NULL)
+		return false;
+
+	pgstat_release_entry_ref(entry_ref->shared_entry->key, entry_ref, false);
+	return true;
+}
+
+/*
  * Acquire exclusive lock on the entry.
  *
  * If nowait is true, it's just a conditional acquire, and the result

@@ -296,6 +296,22 @@ typedef struct PgStat_KindInfo
 	bool		own_hash:1;
 
 	/*
+	 * Should a backend release its reference to an entry once the entry's
+	 * pending stats are flushed?  For variable-numbered stats only.
+	 *
+	 * A local reference keeps a dropped entry from being freed until the
+	 * backend next looks up a stats entry, which an idle backend never does.
+	 * This is worth setting for kinds whose entries are dropped often, e.g.
+	 * by eviction, and are cheap to look up again.
+	 *
+	 * The cost is that, after each flush, the next use of an entry looks it
+	 * up in the shared hash table again instead of using the backend's cached
+	 * reference.  For entries used by many backends, these lookups all touch
+	 * the same shared memory.
+	 */
+	bool		release_ref_after_flush:1;
+
+	/*
 	 * The size of an entry pointed to by PgStatShared_HashEntry->body.  For
 	 * fixed-numbered statistics, this is the size of an entry in
 	 * PgStat_ShmemControl->custom_data.
@@ -913,6 +929,7 @@ extern void pgstat_reset_matching_entries(bool (*do_reset) (PgStatShared_HashEnt
 										  TimestampTz ts);
 
 extern void pgstat_request_entry_refs_gc(void);
+extern bool pgstat_release_entry_ref_if_unused(PgStat_EntryRef *entry_ref);
 extern dsa_pointer pgstat_alloc_entry_body(PgStat_Kind kind);
 extern PgStatShared_Common *pgstat_init_entry(PgStat_Kind kind,
 											  PgStatShared_HashEntry *shhashent,

@@ -1562,7 +1562,11 @@ pgstat_flush_pending_entries(bool nowait)
 		 * staying put.
 		 */
 		if (result == PGSTAT_FLUSH_DONE && xact_boundary)
+		{
 			pgstat_delete_pending_entry(entry_ref);
+			if (kind_info->release_ref_after_flush)
+				(void) pgstat_release_entry_ref_if_unused(entry_ref);
+		}
 		else
 			have_pending = true;
 
