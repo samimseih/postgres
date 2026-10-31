@@ -137,9 +137,9 @@ typedef enum pgssStoreKind
  * Hashtable key that defines the identity of a statement entry.  We separate
  * queries by user and by database even if they are otherwise identical.
  *
- * pgss_store() zeroes this struct before setting fields because pgstat's
- * current variable-numbered API identifies entries by a uint64 objid, and the
- * custom stats bridge hashes the complete key to produce that value.
+ * Callers zero this struct before setting fields because pgstat's current
+ * variable-numbered API identifies entries by a uint64 objid, and the custom
+ * stats bridge hashes the complete key to produce that value.
  */
 typedef struct pgssHashKey
 {
@@ -315,6 +315,8 @@ static int	nesting_level = 0;
 typedef struct pgssQueryState
 {
 	int			nesting_level;	/* nesting level at ExecutorStart */
+	pgssHashKey key;			/* statement identity at ExecutorStart */
+	uint64		stats_objid;	/* core stats object ID at ExecutorStart */
 } pgssQueryState;
 
 /* ID of pg_stat_statements for QueryDesc extension state */
@@ -399,6 +401,8 @@ static void pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 static void pgss_store(const char *query, int64 queryId,
 					   int query_location, int query_len,
 					   bool toplevel,
+					   const pgssHashKey *cached_key,
+					   uint64 cached_stats_objid,
 					   pgssStoreKind kind,
 					   double total_time, uint64 rows,
 					   const BufferUsage *bufusage,
@@ -411,7 +415,8 @@ static void pgss_store(const char *query, int64 queryId,
 static void pg_stat_statements_internal(FunctionCallInfo fcinfo,
 										pgssVersion api_version,
 										bool showtext);
-static PgStat_EntryRef *entry_alloc(pgssHashKey *key, const char *query,
+static PgStat_EntryRef *entry_alloc(const pgssHashKey *key,
+									uint64 stats_objid, const char *query,
 									int query_location, int query_len,
 									int encoding, bool sticky,
 									const JumbleState *jstate);
@@ -434,7 +439,10 @@ static char *generate_normalized_query(const JumbleState *jstate,
 									   const char *query,
 									   int query_loc, int *query_len_p);
 static void pgss_decrease_cur_entry_count(uint64 count);
-static uint64 pgss_stats_entry_id(const pgssHashKey *key);
+static uint64 pgss_stats_objid(const pgssHashKey *key);
+static PgStat_EntryRef *pgss_stats_entry_get_by_objid(const pgssHashKey *key,
+													  uint64 stats_objid,
+													  bool create);
 static PgStat_EntryRef *pgss_stats_entry_get(const pgssHashKey *key,
 											 bool create);
 static bool pgss_stats_entry_matches(PgStatShared_HashEntry *hash_entry,
@@ -711,6 +719,8 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, const JumbleState *jst
 				   query->stmt_location,
 				   query->stmt_len,
 				   nesting_level == 0,
+				   NULL,
+				   0,
 				   PGSS_INVALID,
 				   0,
 				   0,
@@ -794,6 +804,8 @@ pgss_planner(Query *parse,
 				   parse->stmt_location,
 				   parse->stmt_len,
 				   nesting_level == 0,
+				   NULL,
+				   0,
 				   PGSS_PLAN,
 				   INSTR_TIME_GET_MILLISEC(duration),
 				   0,
@@ -850,10 +862,16 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		/* Request all summary instrumentation, i.e. timing, buffers and WAL */
 		queryDesc->query_instr_options |= INSTRUMENT_ALL;
 
-		/* Remember the nesting level for ExecutorEnd */
+		/* Remember the statement identity and nesting level for ExecutorEnd */
 		qstate = MemoryContextAlloc(GetMemoryChunkContext(queryDesc),
 									sizeof(pgssQueryState));
 		qstate->nesting_level = nesting_level;
+		memset(&qstate->key, 0, sizeof(pgssHashKey));
+		qstate->key.userid = GetUserId();
+		qstate->key.dbid = MyDatabaseId;
+		qstate->key.queryid = queryDesc->plannedstmt->queryId;
+		qstate->key.toplevel = nesting_level == 0;
+		qstate->stats_objid = pgss_stats_objid(&qstate->key);
 		SetQueryDescExtensionState(queryDesc, pgss_queryDesc_id, qstate);
 	}
 
@@ -911,7 +929,6 @@ pgss_ExecutorFinish(QueryDesc *queryDesc)
 static void
 pgss_ExecutorEnd(QueryDesc *queryDesc)
 {
-	int64		queryId = queryDesc->plannedstmt->queryId;
 	pgssQueryState *qstate = GetQueryDescExtensionState(queryDesc,
 														pgss_queryDesc_id);
 
@@ -919,15 +936,16 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 	 * Use the nesting level saved at ExecutorStart, if available, since the
 	 * query may end at a different level (e.g. a cursor closed at COMMIT).
 	 */
-	if (queryId != INT64CONST(0) && queryDesc->query_instr &&
-		qstate != NULL &&
+	if (queryDesc->query_instr && qstate != NULL &&
 		pgss_enabled(qstate->nesting_level))
 	{
 		pgss_store(queryDesc->sourceText,
-				   queryId,
+				   qstate->key.queryid,
 				   queryDesc->plannedstmt->stmt_location,
 				   queryDesc->plannedstmt->stmt_len,
-				   qstate->nesting_level == 0,
+				   qstate->key.toplevel,
+				   &qstate->key,
+				   qstate->stats_objid,
 				   PGSS_EXEC,
 				   INSTR_TIME_GET_MILLISEC(queryDesc->query_instr->total),
 				   queryDesc->estate->es_total_processed,
@@ -1065,6 +1083,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   saved_stmt_location,
 				   saved_stmt_len,
 				   nesting_level == 0,
+				   NULL,
+				   0,
 				   PGSS_EXEC,
 				   INSTR_TIME_GET_MILLISEC(duration),
 				   rows,
@@ -1130,6 +1150,8 @@ static void
 pgss_store(const char *query, int64 queryId,
 		   int query_location, int query_len,
 		   bool toplevel,
+		   const pgssHashKey *cached_key,
+		   uint64 cached_stats_objid,
 		   pgssStoreKind kind,
 		   double total_time, uint64 rows,
 		   const BufferUsage *bufusage,
@@ -1141,7 +1163,9 @@ pgss_store(const char *query, int64 queryId,
 		   PlannedStmtOrigin planOrigin)
 {
 	pgssHashKey key;
+	const pgssHashKey *store_key = cached_key;
 	PgStat_EntryRef *entry_ref = NULL;
+	uint64		stats_objid;
 	int			encoding = GetDatabaseEncoding();
 	bool		found;
 
@@ -1161,15 +1185,27 @@ pgss_store(const char *query, int64 queryId,
 	 */
 	query = CleanQuerytext(query, &query_location, &query_len);
 
-	/* Set up key for stats entry search. */
-	memset(&key, 0, sizeof(pgssHashKey));
+	if (store_key == NULL)
+	{
+		/* Set up key for stats entry search. */
+		memset(&key, 0, sizeof(pgssHashKey));
 
-	key.userid = GetUserId();
-	key.dbid = MyDatabaseId;
-	key.queryid = queryId;
-	key.toplevel = toplevel;
+		key.userid = GetUserId();
+		key.dbid = MyDatabaseId;
+		key.queryid = queryId;
+		key.toplevel = toplevel;
+		store_key = &key;
+		stats_objid = pgss_stats_objid(store_key);
+	}
+	else
+	{
+		Assert(store_key->queryid == queryId);
+		Assert(store_key->toplevel == toplevel);
+		Assert(cached_stats_objid == pgss_stats_objid(store_key));
+		stats_objid = cached_stats_objid;
+	}
 
-	entry_ref = pgss_stats_entry_get(&key, false);
+	entry_ref = pgss_stats_entry_get_by_objid(store_key, stats_objid, false);
 	found = entry_ref != NULL;
 
 	if (jstate && found)
@@ -1177,8 +1213,8 @@ pgss_store(const char *query, int64 queryId,
 
 	/* Create new entry, if not present */
 	if (!found)
-		entry_ref = entry_alloc(&key, query, query_location, query_len,
-								encoding, jstate != NULL, jstate);
+		entry_ref = entry_alloc(store_key, stats_objid, query, query_location,
+								query_len, encoding, jstate != NULL, jstate);
 
 	/* Record pending statistics, except when jstate is not NULL. */
 	if (!jstate)
@@ -1298,11 +1334,11 @@ entry_reset(Oid userid, Oid dbid, int64 queryid, bool minmax_only)
 
 			key.toplevel = false;
 			(void) pgstat_drop_entry(PGSS_STATS_KIND, key.dbid,
-									 pgss_stats_entry_id(&key), true);
+									 pgss_stats_objid(&key), true);
 
 			key.toplevel = true;
 			(void) pgstat_drop_entry(PGSS_STATS_KIND, key.dbid,
-									 pgss_stats_entry_id(&key), true);
+									 pgss_stats_objid(&key), true);
 		}
 		else
 			pgstat_drop_matching_entries(PGSS_STATS_KIND,
@@ -1805,8 +1841,8 @@ pg_stat_statements_info(PG_FUNCTION_ARGS)
  * Allocate a new entry.
  */
 static PgStat_EntryRef *
-entry_alloc(pgssHashKey *key, const char *query, int query_location,
-			int query_len, int encoding, bool sticky,
+entry_alloc(const pgssHashKey *key, uint64 stats_objid, const char *query,
+			int query_location, int query_len, int encoding, bool sticky,
 			const JumbleState *jstate)
 {
 	PgStat_EntryRef *entry_ref;
@@ -1825,7 +1861,7 @@ entry_alloc(pgssHashKey *key, const char *query, int query_location,
 											   &query_len);
 
 	LWLockAcquire(&pgss->qtext_lock, LW_SHARED);
-	entry_ref = pgss_stats_entry_get(key, true);
+	entry_ref = pgss_stats_entry_get_by_objid(key, stats_objid, true);
 	shared_entry = (pgssSharedEntry *) entry_ref->shared_stats;
 
 	(void) pgstat_lock_entry(entry_ref, false);
@@ -2127,7 +2163,7 @@ entry_dealloc(bool wait)
 	for (i = 0; i < nvictims; i++)
 	{
 		if (!pgstat_drop_entry(PGSS_STATS_KIND, entries[i]->key.dbid,
-							   pgss_stats_entry_id(&entries[i]->key), true))
+							   pgss_stats_objid(&entries[i]->key), true))
 			request_gc = true;
 	}
 	pgss_decrease_cur_entry_count(nvictims);
@@ -2771,17 +2807,24 @@ pgss_decrease_cur_entry_count(uint64 count)
  * whether core needs a wider custom-key API.
  */
 static uint64
-pgss_stats_entry_id(const pgssHashKey *key)
+pgss_stats_objid(const pgssHashKey *key)
 {
 	return hash_bytes_extended((const unsigned char *) key,
 							   sizeof(pgssHashKey), 0);
 }
 
 static PgStat_EntryRef *
-pgss_stats_entry_get(const pgssHashKey *key, bool create)
+pgss_stats_entry_get_by_objid(const pgssHashKey *key, uint64 stats_objid,
+							  bool create)
 {
 	return pgstat_get_entry_ref(PGSS_STATS_KIND, key->dbid,
-								pgss_stats_entry_id(key), create, NULL);
+								stats_objid, create, NULL);
+}
+
+static PgStat_EntryRef *
+pgss_stats_entry_get(const pgssHashKey *key, bool create)
+{
+	return pgss_stats_entry_get_by_objid(key, pgss_stats_objid(key), create);
 }
 
 static bool
