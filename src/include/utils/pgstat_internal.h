@@ -296,6 +296,18 @@ typedef struct PgStat_KindInfo
 	bool		own_hash:1;
 
 	/*
+	 * Should a backend's references to entries of this kind not outlive the
+	 * flush of their pending statistics?  For variable-numbered stats whose
+	 * entries are dropped often: a backend keeps references only to the
+	 * entries it has pending statistics for, so that dropped entries are
+	 * freed once those are flushed, without asking all backends to release
+	 * their references.  A lookup also replaces a reference to an entry
+	 * dropped or reinitialized since it was obtained, discarding its pending
+	 * statistics.  Lookups after a flush then go to the shared hash table.
+	 */
+	bool		release_refs_after_flush:1;
+
+	/*
 	 * The size of an entry pointed to by PgStatShared_HashEntry->body.  For
 	 * fixed-numbered statistics, this is the size of an entry in
 	 * PgStat_ShmemControl->custom_data.
@@ -913,6 +925,7 @@ extern void pgstat_reset_matching_entries(bool (*do_reset) (PgStatShared_HashEnt
 										  TimestampTz ts);
 
 extern void pgstat_request_entry_refs_gc(void);
+extern void pgstat_release_flushed_entry_refs(void);
 extern dsa_pointer pgstat_alloc_entry_body(PgStat_Kind kind);
 extern PgStatShared_Common *pgstat_init_entry(PgStat_Kind kind,
 											  PgStatShared_HashEntry *shhashent,

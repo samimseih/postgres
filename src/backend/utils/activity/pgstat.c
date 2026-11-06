@@ -846,6 +846,10 @@ pgstat_report_stat(bool force)
 		/* flush of variable-numbered stats tracked in pending entries list */
 		partial_flush |= pgstat_flush_pending_entries(nowait);
 
+		/* release the references not to keep past the flush */
+		if (!IsTransactionOrTransactionBlock())
+			pgstat_release_flushed_entry_refs();
+
 		/* flush of other stats kinds */
 		if (pgstat_report_fixed)
 		{

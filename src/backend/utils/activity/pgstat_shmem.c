@@ -649,7 +649,21 @@ pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid, bool create,
 	 * match here we can avoid taking locks / causing contention.
 	 */
 	if (pgstat_get_entry_ref_cached(key, &entry_ref))
-		return entry_ref;
+	{
+		/*
+		 * For a kind whose references do not outlive their flush, replace a
+		 * reference to an entry dropped or reinitialized since it was
+		 * obtained, discarding its pending statistics.
+		 */
+		if (!pgstat_get_kind_info(kind)->release_refs_after_flush ||
+			(!entry_ref->shared_entry->dropped &&
+			 pg_atomic_read_u32(&entry_ref->shared_entry->generation) ==
+			 entry_ref->generation))
+			return entry_ref;
+
+		pgstat_release_entry_ref(key, entry_ref, true);
+		(void) pgstat_get_entry_ref_cached(key, &entry_ref);
+	}
 
 	Assert(entry_ref != NULL);
 
@@ -986,6 +1000,45 @@ pgstat_release_matching_entry_refs(bool discard_pending, ReleaseMatchCB match,
 
 		pgstat_release_entry_ref(ent->key, ent->entry_ref, discard_pending);
 	}
+}
+
+/*
+ * pgstat_release_matching_entry_refs() callback for
+ * pgstat_release_flushed_entry_refs(): references without pending statistics
+ * to entries of kinds with release_refs_after_flush.
+ */
+static bool
+match_flushed_entry_refs(PgStat_EntryRefHashEntry *ent, Datum match_data)
+{
+	return ent->entry_ref->shared_stats != NULL &&
+		ent->entry_ref->pending == NULL &&
+		pgstat_get_kind_info(ent->key.kind)->release_refs_after_flush;
+}
+
+/*
+ * Release this backend's references to entries of kinds with
+ * release_refs_after_flush, except those with pending statistics.  Called
+ * at a transaction boundary, after flushing pending statistics.
+ */
+void
+pgstat_release_flushed_entry_refs(void)
+{
+	static int	have_kinds = -1;
+
+	/* Kinds are all registered at startup; skip the scan if none needs it */
+	if (have_kinds < 0)
+	{
+		have_kinds = 0;
+		for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)
+		{
+			const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+
+			if (kind_info && kind_info->release_refs_after_flush)
+				have_kinds = 1;
+		}
+	}
+	if (have_kinds)
+		pgstat_release_matching_entry_refs(false, match_flushed_entry_refs, 0);
 }
 
 /*
