@@ -2693,11 +2693,14 @@ entry_dealloc(bool qtext_full)
 	int			i;
 	bool		request_gc = false;
 	pgssGlobalStats *gstats;
+	TimestampTz instr_start;
+	int			instr_scanned;
 
 	/* Someone else may have deallocated entries meanwhile */
 	num_entries = pg_atomic_read_u64(&pgss->num_entries);
 	if (num_entries < (uint64) pgss_max && !qtext_full)
 		return;
+	instr_start = GetCurrentTimestamp();
 
 	/*
 	 * Sort entries by usage and deallocate USAGE_DEALLOC_PERCENT of them.
@@ -2748,6 +2751,7 @@ entry_dealloc(bool qtext_full)
 	dshash_seq_term(&hstat);
 
 	/* Sort into increasing order by usage */
+	instr_scanned = i;
 	qsort(entries, i, sizeof(pgssDeallocEntry), entry_cmp);
 
 	/*
@@ -2798,6 +2802,9 @@ entry_dealloc(bool qtext_full)
 
 	/* Have other backends release their references to the entries */
 	entry_request_refs_gc(request_gc);
+	elog(LOG, "PGSS_PASS us=%ld scanned=%d victims=%d qtext=%d",
+		 (long) (GetCurrentTimestamp() - instr_start), instr_scanned, nvictims,
+		 (int) qtext_full);
 }
 
 /*
@@ -3068,10 +3075,22 @@ entry_make_space(bool evicted)
 	if (evicted || pg_atomic_read_u64(&pgss->num_entries) < limit)
 		return;
 
-	LWLockAcquire(&pgss->lock, LW_EXCLUSIVE);
-	if (pg_atomic_read_u64(&pgss->num_entries) >= limit)
-		entry_dealloc(false);
-	LWLockRelease(&pgss->lock);
+	{
+		TimestampTz w0 = GetCurrentTimestamp();
+		bool		ran = false;
+		long		waited;
+
+		LWLockAcquire(&pgss->lock, LW_EXCLUSIVE);
+		waited = (long) (GetCurrentTimestamp() - w0);
+		if (pg_atomic_read_u64(&pgss->num_entries) >= limit)
+		{
+			entry_dealloc(false);
+			ran = true;
+		}
+		LWLockRelease(&pgss->lock);
+		elog(LOG, "PGSS_WAIT us=%ld total_us=%ld ran=%d", waited,
+			 (long) (GetCurrentTimestamp() - w0), (int) ran);
+	}
 }
 
 /*
